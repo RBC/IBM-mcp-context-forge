@@ -15914,7 +15914,12 @@ class TestTemplateButtonGating:
         assert "/delete" not in html
 
     def test_servers_pagination_query_params_are_js_escaped(self, jinja_env):
-        """Malicious q/tags values must not break out of JS string context."""
+        """Malicious q/tags values must not break out of JS string context.
+
+        query_params are now stored in data-extra-params as JSON (via tojson)
+        and read at runtime via JSON.parse(), so dangerous values must be
+        tojson-encoded in that attribute rather than inlined in the x-data JS.
+        """
         # Standard
         import html as html_stdlib
 
@@ -15944,9 +15949,16 @@ class TestTemplateButtonGating:
         )
 
         decoded_html = html_stdlib.unescape(html)
+
+        # Raw unescaped values must never appear inline in JS
         assert "url.searchParams.set('q', 'x' );alert(1);//');" not in decoded_html
-        assert 'url.searchParams.set("q", "x\\u0027 );alert(1);//");' in decoded_html
-        assert "\\u003c/script\\u003e\\u003cscript\\u003ealert(2)\\u003c/script\\u003e" in decoded_html
+        assert "</script><script>alert(2)</script>" not in decoded_html
+
+        # Values must be JSON-encoded in the data-extra-params attribute.
+        # tojson escapes ' → \u0027 and < > → \u003c \u003e.
+        assert "data-extra-params=" in decoded_html
+        assert r"\u0027" in decoded_html
+        assert r"\u003c" in decoded_html
 
     def test_admin_js_toggle_submit_injects_csrf_token(self):
         """Form submit helpers should inject CSRF token before programmatic submit()."""
@@ -17543,3 +17555,135 @@ class TestAdminCsrfProtection:
 
         with pytest.raises(HTTPException, match="token validation failed"):
             await admin_mod.enforce_admin_csrf(request)
+
+
+# ---------------------------------------------------------------------------
+# Pagination variable cascade isolation (#3244)
+# ---------------------------------------------------------------------------
+
+# Template mirrors the pattern in admin.html for servers/tools/gateways
+# pagination blocks (lines 2489-2503, 3437-3451, 4978-4992).
+_PAGINATION_ISOLATION_TEMPLATE = """\
+{% if 'servers' not in hidden_sections %}
+  {% set page = page if page is defined else 1 %}
+  {% set per_page = per_page if per_page is defined else 50 %}
+  {% set total_items = servers|length if servers is defined else 0 %}
+  {% set total_pages = (total_items + per_page - 1) // per_page if total_items > 0 else 0 %}
+  {% set has_prev = page > 1 %}
+  {% set has_next = (page * per_page) < total_items %}
+  {% set pagination = {
+    'page': page, 'per_page': per_page, 'total_items': total_items,
+    'total_pages': total_pages, 'has_prev': has_prev, 'has_next': has_next
+  } %}
+  SERVERS_TOTAL_ITEMS={{ pagination.total_items }}
+  SERVERS_TOTAL_PAGES={{ pagination.total_pages }}
+{% endif %}
+{% if 'tools' not in hidden_sections %}
+  {% set page = page if page is defined else 1 %}
+  {% set per_page = per_page if per_page is defined else 50 %}
+  {% set total_items = tools|length if tools is defined else 0 %}
+  {% set total_pages = (total_items + per_page - 1) // per_page if total_items > 0 else 0 %}
+  {% set has_prev = page > 1 %}
+  {% set has_next = (page * per_page) < total_items %}
+  {% set pagination = {
+    'page': page, 'per_page': per_page, 'total_items': total_items,
+    'total_pages': total_pages, 'has_prev': has_prev, 'has_next': has_next
+  } %}
+  TOOLS_TOTAL_ITEMS={{ pagination.total_items }}
+  TOOLS_TOTAL_PAGES={{ pagination.total_pages }}
+{% endif %}
+{% if 'gateways' not in hidden_sections %}
+  {% set page = page if page is defined else 1 %}
+  {% set per_page = per_page if per_page is defined else 50 %}
+  {% set total_items = gateways|length if gateways is defined else 0 %}
+  {% set total_pages = (total_items + per_page - 1) // per_page if total_items > 0 else 0 %}
+  {% set has_prev = page > 1 %}
+  {% set has_next = (page * per_page) < total_items %}
+  {% set pagination = {
+    'page': page, 'per_page': per_page, 'total_items': total_items,
+    'total_pages': total_pages, 'has_prev': has_prev, 'has_next': has_next
+  } %}
+  GATEWAYS_TOTAL_ITEMS={{ pagination.total_items }}
+  GATEWAYS_TOTAL_PAGES={{ pagination.total_pages }}
+{% endif %}
+"""
+
+
+def _parse_pagination_output(rendered: str) -> dict[str, int]:
+    """Parse KEY=VALUE pairs from rendered pagination template output."""
+    result = {}
+    for line in rendered.strip().splitlines():
+        line = line.strip()
+        if "=" in line and line[0].isalpha():
+            key, val = line.split("=", 1)
+            result[key.strip()] = int(val.strip())
+    return result
+
+
+class TestPaginationVariableCascade:
+    """Verify each admin section computes pagination from its OWN data (#3244)."""
+
+    def test_tools_pagination_not_poisoned_by_empty_servers(self):
+        """When servers has 0 items, tools section must still show correct pagination."""
+        from jinja2 import Environment
+
+        env = Environment()
+        template = env.from_string(_PAGINATION_ISOLATION_TEMPLATE)
+
+        rendered = template.render(
+            hidden_sections=set(),
+            servers=[],
+            tools=[{"name": f"tool-{i}"} for i in range(75)],
+            gateways=[{"name": f"gw-{i}"} for i in range(30)],
+        )
+
+        values = _parse_pagination_output(rendered)
+
+        assert values["SERVERS_TOTAL_ITEMS"] == 0
+        assert values["SERVERS_TOTAL_PAGES"] == 0
+        assert values["TOOLS_TOTAL_ITEMS"] == 75
+        assert values["TOOLS_TOTAL_PAGES"] == 2
+        assert values["GATEWAYS_TOTAL_ITEMS"] == 30
+
+    def test_tools_pagination_correct_when_servers_hidden(self):
+        """When servers section is hidden, tools computes its own pagination."""
+        from jinja2 import Environment
+
+        env = Environment()
+        template = env.from_string(_PAGINATION_ISOLATION_TEMPLATE)
+
+        rendered = template.render(
+            hidden_sections={"servers"},
+            servers=[],
+            tools=[{"name": f"tool-{i}"} for i in range(120)],
+            gateways=[{"name": f"gw-{i}"} for i in range(10)],
+        )
+
+        values = _parse_pagination_output(rendered)
+
+        assert "SERVERS_TOTAL_ITEMS" not in values
+        assert values["TOOLS_TOTAL_ITEMS"] == 120
+        assert values["TOOLS_TOTAL_PAGES"] == 3
+
+    def test_later_section_not_poisoned_by_earlier_with_different_counts(self):
+        """Each section reflects its own item count, not an earlier section's."""
+        from jinja2 import Environment
+
+        env = Environment()
+        template = env.from_string(_PAGINATION_ISOLATION_TEMPLATE)
+
+        rendered = template.render(
+            hidden_sections=set(),
+            servers=[{"name": f"srv-{i}"} for i in range(200)],
+            tools=[{"name": f"tool-{i}"} for i in range(25)],
+            gateways=[{"name": f"gw-{i}"} for i in range(150)],
+        )
+
+        values = _parse_pagination_output(rendered)
+
+        assert values["SERVERS_TOTAL_ITEMS"] == 200
+        assert values["SERVERS_TOTAL_PAGES"] == 4
+        assert values["TOOLS_TOTAL_ITEMS"] == 25
+        assert values["TOOLS_TOTAL_PAGES"] == 1
+        assert values["GATEWAYS_TOTAL_ITEMS"] == 150
+        assert values["GATEWAYS_TOTAL_PAGES"] == 3
