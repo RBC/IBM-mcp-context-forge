@@ -1080,16 +1080,20 @@ def _normalize_origin_parts(scheme: str, netloc: str) -> tuple[str, str, int]:
 def _request_origin_matches(request: Request) -> bool:
     """Return ``True`` when Origin/Referer matches this request origin.
 
+    The function first performs an exact same-origin comparison using the
+    request's forwarded headers (``X-Forwarded-Proto`` / ``X-Forwarded-Host``).
+    When that fails — common behind layered reverse proxies where forwarded
+    headers reflect internal hops rather than the external scheme — it falls
+    back to checking whether the candidate origin is explicitly listed in
+    ``settings.allowed_origins``.  Wildcard entries (``*``, ``null``, ``""``)
+    are excluded from the fallback to preserve fail-closed behavior.
+
     Args:
         request: Incoming request carrying Origin/Referer and host headers.
 
     Returns:
-        ``True`` when candidate origin exactly matches request origin; otherwise ``False``.
-
-    Note:
-        When the service is deployed behind a reverse proxy, this check relies on
-        ``X-Forwarded-Proto`` / ``X-Forwarded-Host`` values emitted by that proxy.
-        The deployment boundary must sanitize and overwrite forwarded headers.
+        ``True`` when candidate origin matches either the request origin or an
+        entry in ``settings.allowed_origins``; otherwise ``False``.
     """
     origin = request.headers.get("origin")
     referer = request.headers.get("referer")
@@ -1117,7 +1121,29 @@ def _request_origin_matches(request: Request) -> bool:
 
     candidate_parts = _normalize_origin_parts(parsed_candidate.scheme, parsed_candidate.netloc)
     request_parts = _normalize_origin_parts(request_scheme, request_netloc)
-    return candidate_parts == request_parts
+    if candidate_parts == request_parts:
+        return True
+
+    # Fallback: accept origins explicitly listed in settings.allowed_origins.
+    # Handles reverse-proxy deployments where forwarded headers may not
+    # accurately reflect the external scheme/host.
+    for allowed in settings.allowed_origins:
+        # Normalize each allowed origin to avoid config surprises such as
+        # ["https://a.com "] or [" null "], which could otherwise be
+        # mis-parsed or skipped.
+        allowed_normalized = str(allowed).strip()
+        if not allowed_normalized or allowed_normalized == "*" or allowed_normalized.casefold() == "null":
+            continue
+        try:
+            allowed_parsed = urllib.parse.urlparse(allowed_normalized if "://" in allowed_normalized else f"https://{allowed_normalized}")
+            if not allowed_parsed.scheme or not allowed_parsed.netloc:
+                continue
+            if candidate_parts == _normalize_origin_parts(allowed_parsed.scheme, allowed_parsed.netloc):
+                return True
+        except Exception:  # nosec B112 - malformed allowed_origins entry should not crash
+            continue
+
+    return False
 
 
 def _set_admin_csrf_cookie(request: Request, response: Response) -> str:
@@ -3138,6 +3164,9 @@ async def admin_ui(
     Returns:
         Any: Rendered HTML template for the admin dashboard.
 
+    Raises:
+        HTTPException: 403 if a non-admin user supplies a team_id they do not belong to.
+
     Examples:
         >>> callable(admin_ui)
         True
@@ -3201,22 +3230,28 @@ async def admin_ui(
             user_teams = []
 
     # --------------------------------------------------------------------------------
-    # Validate team_id if provided (only when email-based teams are enabled)
-    # If invalid, we currently *ignore* it and fall back to default behavior.
-    # Optionally you can raise HTTPException(403) if you prefer strict rejection.
+    # Validate team_id if provided (only when email-based teams are enabled).
+    # Non-admin users get 403 when they supply a team_id they do not belong to.
+    # Platform admins with unrestricted tokens (is_admin AND token_teams is None)
+    # bypass the membership check, consistent with the codebase admin bypass
+    # convention. Team-scoped admin tokens are still subject to membership checks.
+    # When team_id is None (not sent), selected_team_id stays None and the
+    # unscoped/public path works as expected.
     # --------------------------------------------------------------------------------
     selected_team_id = team_id
     user_email = get_user_email(user)
     if team_id and getattr(settings, "email_auth_enabled", False):
-        # If team list failed to load for some reason, be conservative and drop selection
-        if not user_teams:
-            LOGGER.warning("team_id requested but user_teams not available; ignoring team filter")
-            selected_team_id = None
-        else:
+        _is_admin = bool(user.get("is_admin", False) if isinstance(user, dict) else getattr(user, "is_admin", False))
+        _token_teams = user.get("token_teams") if isinstance(user, dict) else getattr(user, "token_teams", None)
+        if not (_is_admin and _token_teams is None):
+            if not user_teams:
+                LOGGER.warning("team_id requested but user_teams not available; rejecting (team_id=%s)", team_id)
+                raise HTTPException(status_code=403, detail="Unable to verify team membership")
+
             valid_team_ids = {t["id"] for t in user_teams if t.get("id")}
             if str(team_id) not in valid_team_ids:
-                LOGGER.warning("Requested team_id is not in user's teams; ignoring team filter (team_id=%s)", team_id)
-                selected_team_id = None
+                LOGGER.warning("Requested team_id is not in user's teams; rejecting (team_id=%s)", team_id)
+                raise HTTPException(status_code=403, detail="Not a member of the requested team")
 
     # --------------------------------------------------------------------------------
     # Helper: attempt to call a listing function with team_id if it supports it.
