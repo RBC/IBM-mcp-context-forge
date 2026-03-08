@@ -2245,10 +2245,7 @@ def tojson_attr(value: object) -> str:
     Returns:
         Plain string with JSON content (autoescape will HTML-encode it).
     """
-    # Standard
-    import json as _json
-
-    s = _json.dumps(value)
+    s = orjson.dumps(value, default=str).decode()
     # Same HTML-safety replacements as Jinja2's htmlsafe_json_dumps,
     # but we return a plain str so autoescape encodes the remaining `"`.
     s = s.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e").replace("'", "\\u0027")
@@ -6499,6 +6496,7 @@ async def handle_rpc(request: Request, db: Session = Depends(get_db), user=Depen
                 db,
                 user_email=user_email_rpc,
                 token_teams=token_teams_rpc,
+                server_id=server_id,
             )
             db.commit()
             db.close()
