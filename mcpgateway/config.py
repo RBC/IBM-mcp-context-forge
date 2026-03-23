@@ -327,6 +327,8 @@ class Settings(BaseSettings):
     sso_okta_client_id: Optional[str] = Field(default=None, description="Okta client ID")
     sso_okta_client_secret: Optional[SecretStr] = Field(default=None, description="Okta client secret")
     sso_okta_issuer: Optional[str] = Field(default=None, description="Okta issuer URL")
+    sso_okta_scope: str = Field(default="openid profile email", description="Okta OIDC scopes (space-separated)")
+    okta_group_mapping: Optional[str] = Field(default=None, description="JSON mapping of Okta group names to team UUIDs")
 
     sso_keycloak_enabled: bool = Field(default=False, description="Enable Keycloak OIDC authentication")
     sso_keycloak_base_url: Optional[str] = Field(default=None, description="Keycloak base URL (e.g., https://keycloak.example.com)")
@@ -1556,6 +1558,10 @@ class Settings(BaseSettings):
     max_tool_retries: int = 3
     tool_rate_limit: int = 100  # requests per minute
     tool_concurrent_limit: int = 10
+
+    # Content Security - Size Limits
+    content_max_resource_size: int = Field(default=102400, ge=1024, le=10485760, description="Maximum size in bytes for resource content (default: 100KB)")  # 100KB  # Minimum 1KB  # Maximum 10MB
+    content_max_prompt_size: int = Field(default=10240, ge=512, le=1048576, description="Maximum size in bytes for prompt templates (default: 10KB)")  # 10KB  # Minimum 512 bytes  # Maximum 1MB
 
     # MCP Session Pool - reduces per-request latency from ~20ms to ~1-2ms
     # Disabled by default for safety. Enable explicitly in production after testing.
