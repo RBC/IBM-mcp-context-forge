@@ -38,6 +38,7 @@ import html
 import json
 import logging
 import re
+import signal
 import sys
 from typing import Any, AsyncIterator, Dict, List, Optional, TypeAlias, Union
 from urllib.parse import urlparse, urlunparse
@@ -1701,6 +1702,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         logger.info("All services initialized successfully")
 
+        # First-Party
+        from mcpgateway.handlers.signal_handlers import sighup_handler  # pylint: disable=import-outside-toplevel
+
+        signal.signal(signal.SIGHUP, sighup_handler)
+
         # Start cache invalidation subscriber for cross-worker cache synchronization
         # First-Party
         from mcpgateway.cache.registry_cache import get_cache_invalidation_subscriber  # pylint: disable=import-outside-toplevel
@@ -1769,6 +1775,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             raise SystemExit(1)
         raise
     finally:
+        # Restore default SIGHUP handling in case we reset signal handlers.
+        try:
+            signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Failed to restore default SIGHUP handler: {exc}")
+
         if aggregation_stop_event is not None:
             aggregation_stop_event.set()
         for task in (aggregation_backfill_task, aggregation_loop_task):
@@ -10840,6 +10852,12 @@ logger.info(f"Admin API enabled: {ADMIN_API_ENABLED}")
 if ADMIN_API_ENABLED:
     logger.info("Including admin_router - Admin API enabled")
     app.include_router(admin_router)  # Admin routes imported from admin.py
+
+    # Validate section-to-permission mapping consistency at startup
+    # First-Party
+    from mcpgateway.admin import validate_section_permissions
+
+    validate_section_permissions(admin_router)
 else:
     logger.warning("Admin API routes not mounted - Admin API disabled via MCPGATEWAY_ADMIN_API_ENABLED=False")
 
