@@ -279,6 +279,24 @@ class Settings(BaseSettings):
         default=False,
         description="Enable the experimental Rust-owned MCP session-bound auth-context reuse path for direct public /mcp ingress.",
     )
+    mcp_rust_ingress: Literal["internal", "public"] = Field(
+        default="internal",
+        description=(
+            "Selects which Rust MCP ingress shape MCPIngressMount uses when boot mode is "
+            "edge or full and no shadow override is in effect. 'internal' (default) uses "
+            "the trusted Python→Rust forwarder (RustMCPRuntimeProxy) over the internal "
+            "listener at MCP_RUST_LISTEN_HTTP/UDS; 'public' uses an nginx-style reverse "
+            "proxy to the Rust public listener at MCP_RUST_PUBLIC_LISTEN_HTTP — useful "
+            "for single-process deployments without nginx in front. Pydantic rejects "
+            "any other value at config load."
+        ),
+    )
+    mcp_rust_public_proxy_upstream: str = Field(
+        default="http://127.0.0.1:8787",
+        description=(
+            "Upstream URL the 'public' MCP ingress shape forwards to. Defaults to the " "loopback address that matches docker-entrypoint.sh's " "MCP_RUST_PUBLIC_LISTEN_HTTP=0.0.0.0:8787 default."
+        ),
+    )
     experimental_rust_a2a_runtime_enabled: bool = Field(
         default=False,
         description="Enable the experimental Rust A2A runtime sidecar for registered A2A agent invocations.",
@@ -556,6 +574,41 @@ class Settings(BaseSettings):
             "Fail closed on DNS resolution errors. When true, URLs that cannot be resolved "
             "are rejected. When false, unresolvable hostnames are allowed through "
             "(hostname blocklist still applies)."
+        ),
+    )
+
+    # UAID Cross-Gateway Routing Security
+    uaid_allowed_domains: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Domain allowlist for UAID cross-gateway routing. When not empty, only UAIDs with endpoints "
+            "ending in these domains will be allowed for cross-gateway routing. Empty list = allow all domains."
+        ),
+    )
+
+    uaid_max_length: int = Field(
+        default=2048,
+        ge=512,  # Minimum: accommodate shortest valid UAID
+        le=2048,  # Maximum: MUST match database column length (a2a_agents.uaid String(2048))
+        description=(
+            "Maximum allowed length for UAID strings. Used to prevent DoS attacks via "
+            "excessively long UAID parsing. Must not exceed database column limit (2048). "
+            "Default 2048 matches database capacity. Operators can reduce for stricter DoS "
+            "protection but cannot exceed database schema limit."
+        ),
+    )
+
+    uaid_max_federation_hops: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description=(
+            "Maximum UAID cross-gateway federation hops. Each outbound hop stamps "
+            "`X-Contextforge-UAID-Hop: N+1`; inbound calls at hop >= this limit are "
+            "rejected with 404 to break recursion. Covers both A→B→A loops and "
+            "self-referential `endpoint_url` loops. Default 5 accommodates "
+            "multi-tenant partner chains (Prod → Partner1 → Partner2 → Partner3) "
+            "while still terminating loops quickly (a ping-pong trips in 4 hops)."
         ),
     )
 
