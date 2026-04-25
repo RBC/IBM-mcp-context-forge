@@ -153,7 +153,7 @@ from mcpgateway.services.a2a_server_service import A2AServerService
 from mcpgateway.services.a2a_service import A2AAgentError, A2AAgentNameConflictError, A2AAgentNotFoundError, A2AAgentService
 from mcpgateway.services.cancellation_service import cancellation_service
 from mcpgateway.services.completion_service import CompletionError, CompletionService
-from mcpgateway.services.content_security import ContentSizeError, ContentTypeError
+from mcpgateway.services.content_security import ContentPatternError, ContentSizeError, ContentTypeError, TemplateValidationError
 from mcpgateway.services.email_auth_service import EmailAuthService
 from mcpgateway.services.export_service import ExportError, ExportService
 from mcpgateway.services.gateway_service import GatewayConnectionError, GatewayDuplicateConflictError, GatewayError, GatewayNameConflictError, GatewayNotFoundError
@@ -179,6 +179,7 @@ from mcpgateway.transports.streamablehttp_transport import (
     user_context_var,
 )
 from mcpgateway.utils import uaid as uaid_utils
+from mcpgateway.utils.admin_check import is_admin_bypass_granted
 from mcpgateway.utils.error_formatter import ErrorFormatter
 from mcpgateway.utils.internal_http import internal_loopback_base_url, internal_loopback_verify
 from mcpgateway.utils.metadata_capture import MetadataCapture
@@ -1817,10 +1818,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # only the cross-worker affinity machinery is gated here.
         if settings.mcpgateway_session_affinity_enabled:
             # First-Party
-            from mcpgateway.services.session_affinity import (  # pylint: disable=import-outside-toplevel
-                get_session_affinity,
-                start_affinity_notification_service,
-            )
+            from mcpgateway.services.session_affinity import get_session_affinity, start_affinity_notification_service  # pylint: disable=import-outside-toplevel
 
             await start_affinity_notification_service(gateway_service)
             pool = get_session_affinity()
@@ -2422,6 +2420,55 @@ async def content_size_exception_handler(_request: Request, exc: ContentSizeErro
         ORJSONResponse: A 413 Payload Too Large response with structured error details.
     """
     return ORJSONResponse(status_code=413, content={"detail": {"error": f"{exc.content_type} size limit exceeded", "message": str(exc), "actual_size": exc.actual_size, "max_size": exc.max_size}})
+
+
+@app.exception_handler(TemplateValidationError)
+async def template_validation_exception_handler(_request: Request, exc: TemplateValidationError):
+    """Handle template validation errors globally.
+
+    Args:
+        _request: The incoming request (unused, required by FastAPI handler interface).
+        exc: The TemplateValidationError with template_name, reason, and pattern.
+
+    Returns:
+        ORJSONResponse: A 400 Bad Request response with structured error details.
+    """
+    error_detail = {
+        "error": "Template validation failed",
+        "message": str(exc),
+        "template_name": exc.template_name,
+        "reason": exc.reason,
+    }
+    # DO NOT include pattern - it leaks internal security policy (CWE-209 fix)
+    return ORJSONResponse(status_code=400, content={"detail": error_detail})
+
+
+@app.exception_handler(ContentPatternError)
+async def content_pattern_error_handler(_request: Request, exc: ContentPatternError):
+    """Handle malicious pattern detection errors globally (US-3).
+
+    Returns HTTP 400 with structured error response.
+    Does NOT leak internal patterns or content snippets (CWE-209 fix).
+
+    Args:
+        _request: The incoming request (unused, required by FastAPI handler interface).
+        exc: The ContentPatternError with violation details.
+
+    Returns:
+        ORJSONResponse: A 400 Bad Request response with structured error details.
+    """
+    return ORJSONResponse(
+        status_code=400,
+        content={
+            "detail": {
+                "error": "Malicious pattern detected",
+                "message": f"Content validation failed: {exc.content_type} contains potentially malicious patterns",
+                "violation_type": exc.violation_type or "unknown",
+                "content_type": exc.content_type,
+                # DO NOT include pattern_matched or content_snippet (security)
+            }
+        },
+    )
 
 
 # RFC 9110 §5.6.2 'token' pattern for header field names:
@@ -6091,13 +6138,20 @@ async def subscribe_resource(request: Request, user=Depends(get_current_user_wit
     logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is subscribing to resource")
     user_email, token_teams = _get_scoped_resource_access_context(request, user)
 
+    # Pre-resolve admin bypass once using a request-scoped session, keeping
+    # auth context at the HTTP boundary instead of inside the long-lived
+    # SSE generator.  is_admin_bypass_granted encodes the full security
+    # contract (including the token_teams=None guard for #4106).
+    with SessionLocal() as _admin_db:
+        is_admin_bypass = is_admin_bypass_granted(_admin_db, user_email, token_teams)
+
     async def sse_generator():
         """Generate SSE-formatted events from resource subscription changes.
 
         Yields:
             str: SSE-formatted event data.
         """
-        async for event in resource_service.subscribe_events(user_email=user_email, token_teams=token_teams):
+        async for event in resource_service.subscribe_events(user_email=user_email, token_teams=token_teams, is_admin_bypass=is_admin_bypass):
             yield f"data: {orjson.dumps(event).decode()}\n\n"
 
     return StreamingResponse(sse_generator(), media_type="text/event-stream")
@@ -6360,6 +6414,12 @@ async def create_prompt(
         if isinstance(e, ContentSizeError):
             logger.error(f"Content size exceeded in creating prompt: {e}")
             raise HTTPException(status_code=413, detail={"error": f"{e.content_type} size limit exceeded", "message": str(e), "actual_size": e.actual_size, "max_size": e.max_size})
+        if isinstance(e, TemplateValidationError):
+            logger.error(f"Template validation failed while creating prompt: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "Template validation failed", "message": str(e), "template_name": e.template_name, "reason": e.reason, "pattern": e.pattern if e.pattern else None},
+            )
         # For any other unexpected errors, return a 500 Internal Server Error
         logger.error(f"Unexpected error while creating prompt: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while creating the prompt")
@@ -6557,6 +6617,12 @@ async def update_prompt(
         if isinstance(e, ContentSizeError):
             logger.error(f"Content size exceeded in updating prompt: {e}")
             raise HTTPException(status_code=413, detail={"error": f"{e.content_type} size limit exceeded", "message": str(e), "actual_size": e.actual_size, "max_size": e.max_size})
+        if isinstance(e, TemplateValidationError):
+            logger.error(f"Template validation failed while updating prompt: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "Template validation failed", "message": str(e), "template_name": e.template_name, "reason": e.reason, "pattern": e.pattern if e.pattern else None},
+            )
         # For any other unexpected errors, return a 500 Internal Server Error
         logger.error(f"Unexpected error while updating prompt: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while updating the prompt")
@@ -9116,7 +9182,7 @@ async def handle_internal_a2a_agent_resolve(request: Request, agent_name: str):
             if server_agent:
                 return ORJSONResponse(status_code=200, content=server_agent)
             return ORJSONResponse(status_code=404, content={"error": f"agent '{agent_name}' not found"})
-        if not service._check_agent_access(agent, user_email, token_teams):  # pylint: disable=protected-access
+        if not await service._check_agent_access(db, agent, user_email, token_teams):  # pylint: disable=protected-access
             # Surface visibility-denial as 403 to the trusted sidecar
             # caller (inside _is_trusted_internal_mcp_runtime_request
             # above) so it can avoid falling through to UAID
@@ -9177,7 +9243,7 @@ async def handle_internal_a2a_agent_card(request: Request, agent_name: str):
         agent = db.query(DbA2AAgent).filter(DbA2AAgent.name == agent_name, DbA2AAgent.enabled.is_(True)).first()
         card = None
         if agent is not None:
-            if service._check_agent_access(agent, user_email, token_teams):  # pylint: disable=protected-access
+            if await service._check_agent_access(db, agent, user_email, token_teams):  # pylint: disable=protected-access
                 card = service.get_agent_card(db, agent_name)
             else:
                 logger.warning("A2A agent %r visibility-denied for user=%s teams=%s on card", agent_name, user_email, token_teams)
@@ -9220,7 +9286,7 @@ async def handle_internal_a2a_tasks_get(request: Request):
 
         user_email, token_teams = _get_internal_a2a_scope_context(request)
         service = A2AAgentService()
-        task = service.get_task(db, task_id, agent_id=agent_id, user_email=user_email, token_teams=token_teams)
+        task = await service.get_task(db, task_id, agent_id=agent_id, user_email=user_email, token_teams=token_teams)
         if task is None:
             return ORJSONResponse(status_code=404, content={"error": f"task '{task_id}' not found"})
         return ORJSONResponse(status_code=200, content=task)
@@ -9294,7 +9360,7 @@ async def handle_internal_a2a_tasks_cancel(request: Request):
 
         user_email, token_teams = _get_internal_a2a_scope_context(request)
         service = A2AAgentService()
-        task = service.cancel_task(db, task_id, agent_id=agent_id, user_email=user_email, token_teams=token_teams)
+        task = await service.cancel_task(db, task_id, agent_id=agent_id, user_email=user_email, token_teams=token_teams)
         if task is None:
             return ORJSONResponse(status_code=404, content={"error": f"task '{task_id}' not found"})
         return ORJSONResponse(status_code=200, content=task)
@@ -9333,7 +9399,7 @@ async def handle_internal_a2a_push_create(request: Request):
 
         user_email, token_teams = _get_internal_a2a_scope_context(request)
         service = A2AAgentService()
-        if not service._check_agent_access_by_id(db, body["a2a_agent_id"], user_email, token_teams):  # pylint: disable=protected-access
+        if not await service._check_agent_access_by_id(db, body["a2a_agent_id"], user_email, token_teams):  # pylint: disable=protected-access
             logger.warning("A2A agent_id=%s visibility-denied for user=%s teams=%s on push/create", body["a2a_agent_id"], user_email, token_teams)
             return ORJSONResponse(status_code=404, content={"error": "agent not found"})
         cfg = service.create_push_config(db, validated.model_dump())
@@ -9372,7 +9438,7 @@ async def handle_internal_a2a_push_get(request: Request):
         cfg = service.get_push_config(db, task_id, agent_id=agent_id)
         if cfg is None:
             return ORJSONResponse(status_code=404, content={"error": f"push config for task '{task_id}' not found"})
-        if not service._check_agent_access_by_id(db, cfg["a2a_agent_id"], user_email, token_teams):  # pylint: disable=protected-access
+        if not await service._check_agent_access_by_id(db, cfg["a2a_agent_id"], user_email, token_teams):  # pylint: disable=protected-access
             logger.warning("A2A push-config task_id=%s (agent_id=%s) visibility-denied for user=%s teams=%s on push/get", task_id, cfg["a2a_agent_id"], user_email, token_teams)
             return ORJSONResponse(status_code=404, content={"error": f"push config for task '{task_id}' not found"})
         return ORJSONResponse(status_code=200, content=cfg)
@@ -9448,7 +9514,7 @@ async def handle_internal_a2a_push_delete(request: Request):
         user_email, token_teams = _get_internal_a2a_scope_context(request)
         service = A2AAgentService()
         cfg = db.query(A2APushNotificationConfig).filter(A2APushNotificationConfig.id == config_id).first()
-        if cfg and not service._check_agent_access_by_id(db, cfg.a2a_agent_id, user_email, token_teams):  # pylint: disable=protected-access
+        if cfg and not await service._check_agent_access_by_id(db, cfg.a2a_agent_id, user_email, token_teams):  # pylint: disable=protected-access
             logger.warning("A2A push-config id=%s (agent_id=%s) visibility-denied for user=%s teams=%s on push/delete", config_id, cfg.a2a_agent_id, user_email, token_teams)
             return ORJSONResponse(status_code=404, content={"error": f"push config '{config_id}' not found"})
         deleted = service.delete_push_config(db, config_id)
@@ -9509,7 +9575,7 @@ async def handle_internal_a2a_events_flush(request: Request):
                 )
             agent_ids = {t.a2a_agent_id for t in tasks}
             for agent_id in agent_ids:
-                if not service._check_agent_access_by_id(db, agent_id, user_email, token_teams):  # pylint: disable=protected-access
+                if not await service._check_agent_access_by_id(db, agent_id, user_email, token_teams):  # pylint: disable=protected-access
                     logger.warning("A2A events/flush denied: user=%s teams=%s lacks access to agent_id=%s (referenced by a flushed event)", user_email, token_teams, agent_id)
                     return ORJSONResponse(status_code=403, content={"error": "access denied for one or more referenced tasks"})
 
@@ -9550,7 +9616,7 @@ async def handle_internal_a2a_events_replay(request: Request):
         task_row = db.query(DbA2ATask).filter(DbA2ATask.task_id == task_id).first()
         if task_row is None:
             return ORJSONResponse(status_code=404, content={"error": "task not found"})
-        if not service._check_agent_access_by_id(db, task_row.a2a_agent_id, user_email, token_teams):  # pylint: disable=protected-access
+        if not await service._check_agent_access_by_id(db, task_row.a2a_agent_id, user_email, token_teams):  # pylint: disable=protected-access
             logger.warning("A2A task_id=%s (agent_id=%s) visibility-denied for user=%s teams=%s on events/replay", task_id, task_row.a2a_agent_id, user_email, token_teams)
             return ORJSONResponse(status_code=404, content={"error": "task not found"})
         events = service.replay_events(db, task_id, after_sequence, limit=limit)
