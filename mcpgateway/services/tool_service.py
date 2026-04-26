@@ -80,7 +80,7 @@ from mcpgateway.services.rust_a2a_runtime import get_rust_a2a_runtime_client, Ru
 from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.services.team_management_service import TeamManagementService
 from mcpgateway.services.upstream_session_registry import downstream_session_id_from_request_context, get_upstream_session_registry, RegistryNotInitializedError, TransportType
-from mcpgateway.utils.admin_check import is_admin_bypass_granted
+from mcpgateway.utils.admin_check import is_user_admin
 from mcpgateway.utils.correlation_id import get_correlation_id
 from mcpgateway.utils.create_slug import slugify
 from mcpgateway.utils.display_name import generate_display_name
@@ -1147,8 +1147,13 @@ class ToolService(BaseService):
         if visibility == "public":
             return True
 
-        if is_admin_bypass_granted(db, user_email, token_teams):
-            return True
+        # Admin bypass (PR #4341 invariant): never reveal another user's private rows.
+        # Anonymous bypass sees public + team only; a DB-resolved admin session
+        # additionally sees their own private rows. Matches a2a_service._visible_agent_ids.
+        if token_teams is None and user_email is None:
+            return visibility != "private"
+        if token_teams is None and user_email and is_user_admin(db, user_email):
+            return visibility != "private" or tool_owner_email == user_email
 
         # No user context (but not admin) = deny access to non-public tools
         if not user_email:
@@ -3102,22 +3107,29 @@ class ToolService(BaseService):
         requesting_user_email: Optional[str] = None,
         requesting_user_is_admin: bool = False,
         requesting_user_team_roles: Optional[Dict[str, str]] = None,
+        token_teams: Optional[List[str]] = None,
     ) -> ToolRead:
         """
-        Retrieve a tool by its ID.
+        Retrieve a tool by its ID with access control.
 
         Args:
             db (Session): The SQLAlchemy database session.
             tool_id (str): The unique identifier of the tool.
-            requesting_user_email (Optional[str]): Email of the requesting user for header masking.
+            requesting_user_email (Optional[str]): Email of the requesting user for access control.
             requesting_user_is_admin (bool): Whether the requester is an admin.
             requesting_user_team_roles (Optional[Dict[str, str]]): {team_id: role} for the requester.
+                Used only for response masking (``convert_tool_to_read``), not for visibility.
+            token_teams (Optional[List[str]]): JWT-scoped team list used for visibility checks.
+                ``None`` means unrestricted admin (paired with ``requesting_user_email=None``).
+                ``[]`` means public-only scope. ``[...]`` means team-scoped.
+                This is kept separate from ``requesting_user_team_roles`` to avoid the Layer 1
+                visibility check silently widening a scoped token to full DB team membership.
 
         Returns:
             ToolRead: The tool object.
 
         Raises:
-            ToolNotFoundError: If the tool is not found.
+            ToolNotFoundError: If the tool is not found or access is denied.
 
         Examples:
             >>> from mcpgateway.services.tool_service import ToolService
@@ -3133,6 +3145,34 @@ class ToolService(BaseService):
         """
         tool = db.get(DbTool, tool_id)
         if not tool:
+            raise ToolNotFoundError(f"Tool not found: {tool_id}")
+
+        # SECURITY (Layer 1): forward JWT-scoped token_teams; DO NOT widen to DB team roles.
+        is_admin_bypass = requesting_user_is_admin and requesting_user_email is None
+        access_user_email = None if is_admin_bypass else requesting_user_email
+        access_token_teams = None if is_admin_bypass else token_teams
+
+        tool_payload = {
+            "visibility": tool.visibility,
+            "team_id": tool.team_id,
+            "owner_email": tool.owner_email,
+        }
+
+        if not await self._check_tool_access(db, tool_payload, access_user_email, access_token_teams):
+            structured_logger.log(
+                level="INFO",
+                message="Tool access denied",
+                event_type="tool_access_denied",
+                component="tool_service",
+                resource_type="tool",
+                resource_id=str(tool.id),
+                team_id=getattr(tool, "team_id", None),
+                user_email=requesting_user_email,
+                custom_fields={
+                    "visibility": tool.visibility,
+                    "admin_bypass": is_admin_bypass,
+                },
+            )
             raise ToolNotFoundError(f"Tool not found: {tool_id}")
 
         tool_read = self.convert_tool_to_read(
@@ -3868,6 +3908,12 @@ class ToolService(BaseService):
         if not gateway_url:
             return {"eligible": False, "fallbackReason": "missing-gateway-url"}
 
+        # Tracks whether we entered the OAuth authorization_code "no DB token" branch.
+        # When True, the auth requirement is deferred to AFTER tool_pre_invoke hooks
+        # run so plugins (e.g. Vault) can inject auth. The deny-path check below the
+        # plugin invocation enforces the requirement locally with an actionable error.
+        oauth_authcode_no_db_token = False
+
         if has_gateway and gateway_auth_type == "oauth" and isinstance(gateway_oauth_config, dict) and gateway_oauth_config:
             grant_type = gateway_oauth_config.get("grant_type", "client_credentials")
             if grant_type == "authorization_code":
@@ -3884,7 +3930,17 @@ class ToolService(BaseService):
                     if access_token:
                         headers = {"Authorization": f"Bearer {access_token}"}
                     else:
-                        raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
+                        # No DB-stored OAuth token. Defer the auth requirement to after
+                        # tool_pre_invoke hooks run so plugins (e.g. Vault) can inject
+                        # auth headers. The post-hook check below enforces the requirement
+                        # locally with an actionable error if no plugin provides auth.
+                        oauth_authcode_no_db_token = True
+                        headers = {}
+                        logger.info(
+                            "OAuth authorization_code gateway '%s' invoked without DB-stored token; deferring auth check to allow plugin injection",
+                            gateway_name,
+                            extra={"gateway_id": gateway_id_str, "user": app_user_email or "<unknown>"},
+                        )
                 except Exception as e:
                     logger.error(f"Failed to obtain stored OAuth token for gateway {gateway_name}: {e}")
                     raise ToolInvocationError(f"OAuth token retrieval failed for gateway: {str(e)}")
@@ -3947,6 +4003,21 @@ class ToolService(BaseService):
                     for hk, hv in plugin_headers.items():
                         if hk and hv:
                             runtime_headers[str(hk).lower()] = str(hv)
+
+        # Defense in depth: strip X-Vault-Tokens (case-insensitive) from outbound
+        # headers. The Vault plugin removes this header when it processes the token,
+        # but stripping unconditionally prevents leakage when the plugin is disabled,
+        # errors in permissive mode, or the header is mistakenly in passthrough_allowed.
+        runtime_headers = {hk: hv for hk, hv in runtime_headers.items() if hk.lower() != "x-vault-tokens"}
+
+        # OAuth authorization_code deny-path: if we entered the no-DB-token branch
+        # above and no plugin (or other auth source) injected an Authorization header,
+        # fail locally with an actionable error rather than relying on upstream 401.
+        # This restores the original UX directing the user to /oauth/authorize/{id}
+        # while still allowing legitimate plugin-injected auth (e.g. Vault) to satisfy
+        # the requirement.
+        if oauth_authcode_no_db_token and not any(hk.lower() == "authorization" for hk in runtime_headers):
+            raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
 
         runtime_headers = inject_trace_context_headers(runtime_headers)
 
@@ -4966,6 +5037,12 @@ class ToolService(BaseService):
                 elif tool_integration_type == "MCP":
                     transport = tool_request_type.lower() if tool_request_type else "sse"
 
+                    # Tracks whether we entered the OAuth authorization_code "no DB token" branch.
+                    # When True, the auth requirement is deferred to AFTER tool_pre_invoke hooks
+                    # run so plugins (e.g. Vault) can inject auth. The deny-path check below the
+                    # plugin invocation enforces the requirement locally with an actionable error.
+                    oauth_authcode_no_db_token = False
+
                     # Handle OAuth authentication for the gateway (using local variables)
                     # NOTE: Use has_gateway instead of gateway to avoid accessing detached ORM object
                     if has_gateway and gateway_auth_type == "oauth" and isinstance(gateway_oauth_config, dict) and gateway_oauth_config:
@@ -4990,8 +5067,17 @@ class ToolService(BaseService):
                                 if access_token:
                                     headers = {"Authorization": f"Bearer {access_token}"}
                                 else:
-                                    # User hasn't authorized this gateway yet
-                                    raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
+                                    # No DB-stored OAuth token. Defer the auth requirement to after
+                                    # tool_pre_invoke hooks run so plugins (e.g. Vault) can inject
+                                    # auth headers. The post-hook check below enforces the requirement
+                                    # locally with an actionable error if no plugin provides auth.
+                                    oauth_authcode_no_db_token = True
+                                    headers = {}
+                                    logger.info(
+                                        "OAuth authorization_code gateway '%s' invoked without DB-stored token; deferring auth check to allow plugin injection",
+                                        gateway_name,
+                                        extra={"gateway_id": gateway_id_str, "user": app_user_email or "<unknown>"},
+                                    )
                             except Exception as e:
                                 logger.error(f"Failed to obtain stored OAuth token for gateway {gateway_name}: {e}")
                                 raise ToolInvocationError(f"OAuth token retrieval failed for gateway: {str(e)}")
@@ -5531,6 +5617,21 @@ class ToolService(BaseService):
                             arguments = payload.args
                             if payload.headers is not None:
                                 headers = payload.headers.model_dump()
+
+                    # Defense in depth: strip X-Vault-Tokens (case-insensitive) from outbound
+                    # headers. The Vault plugin removes this header when it processes the token,
+                    # but stripping unconditionally prevents leakage when the plugin is disabled,
+                    # errors in permissive mode, or the header is mistakenly in passthrough_allowed.
+                    headers = {hk: hv for hk, hv in headers.items() if hk.lower() != "x-vault-tokens"}
+
+                    # OAuth authorization_code deny-path: if we entered the no-DB-token branch
+                    # above and no plugin (or other auth source) injected an Authorization header,
+                    # fail locally with an actionable error rather than relying on upstream 401.
+                    # This restores the original UX directing the user to /oauth/authorize/{id}
+                    # while still allowing legitimate plugin-injected auth (e.g. Vault) to satisfy
+                    # the requirement.
+                    if oauth_authcode_no_db_token and not any(hk.lower() == "authorization" for hk in headers):
+                        raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
 
                     with create_child_span("tool.gateway_call", {"tool.name": name, "tool.id": tool_id, "tool.integration_type": "MCP"}):
                         tool_call_result = ToolResult(content=[TextContent(text="", type="text")])

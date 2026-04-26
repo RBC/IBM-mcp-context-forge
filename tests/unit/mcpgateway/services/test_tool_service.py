@@ -5966,22 +5966,33 @@ class TestToolAccessAuthorization:
         assert await tool_service._check_tool_access(mock_db, tool_payload, user_email=None, token_teams=None) is True
 
     @pytest.mark.asyncio
-    async def test_check_tool_access_admin_bypass(self, tool_service, mock_db):
-        """Admin (user_email=None, token_teams=None) should have full access."""
+    async def test_check_tool_access_admin_bypass_denied_for_private(self, tool_service, mock_db):
+        """Admin bypass does NOT grant access to private resources (security requirement)."""
         private_tool = {"id": "1", "visibility": "private", "owner_email": "secret@test.com", "team_id": "secret-team"}
 
-        # Admin bypass: both None = unrestricted access
-        assert await tool_service._check_tool_access(mock_db, private_tool, user_email=None, token_teams=None) is True
+        # Admin bypass: both None, but private resources are NEVER accessible via admin bypass
+        assert await tool_service._check_tool_access(mock_db, private_tool, user_email=None, token_teams=None) is False
+
+    @pytest.mark.asyncio
+    async def test_check_tool_access_admin_bypass_grants_team_access(self, tool_service, mock_db):
+        """Admin bypass grants access to team resources."""
+        team_tool = {"id": "1", "visibility": "team", "owner_email": "owner@test.com", "team_id": "team-abc"}
+
+        # Admin bypass: both None = access to team resources
+        assert await tool_service._check_tool_access(mock_db, team_tool, user_email=None, token_teams=None) is True
 
     @pytest.mark.asyncio
     async def test_check_tool_access_database_admin_bypass(self, tool_service, mock_db):
-        """User with is_admin=True in database should get bypass ONLY with unrestricted token."""
-        private_tool = {"id": "1", "visibility": "private", "owner_email": "secret@test.com", "team_id": "secret-team"}
+        """DB admin bypass: own private allowed, other user's private denied (PR #4341)."""
+        other_users_private = {"id": "1", "visibility": "private", "owner_email": "secret@test.com", "team_id": "secret-team"}
+        own_private = {"id": "2", "visibility": "private", "owner_email": "admin@test.com", "team_id": "secret-team"}
 
         install_admin_user(mock_db)
 
-        # Unrestricted session token (token_teams=None) + DB admin → bypass
-        assert await tool_service._check_tool_access(mock_db, private_tool, user_email="admin@test.com", token_teams=None) is True
+        # token_teams=None + DB admin viewing OWN private → allowed (#4341 carve-out for self-access)
+        assert await tool_service._check_tool_access(mock_db, own_private, user_email="admin@test.com", token_teams=None) is True
+        # token_teams=None + DB admin viewing OTHER user's private → denied (#4341 invariant)
+        assert await tool_service._check_tool_access(mock_db, other_users_private, user_email="admin@test.com", token_teams=None) is False
 
     @pytest.mark.asyncio
     async def test_check_tool_access_admin_with_narrowed_token_still_narrowed(self, tool_service, mock_db):
@@ -6041,6 +6052,24 @@ class TestToolAccessAuthorization:
 
         # Even owner with public-only token is denied
         assert await tool_service._check_tool_access(mock_db, private_tool, user_email="owner@test.com", token_teams=[]) is False
+
+    @pytest.mark.asyncio
+    async def test_get_tool_access_denied_raises_not_found(self, tool_service, mock_db):
+        """Test get_tool raises ToolNotFoundError when access is denied (line 3061)."""
+        # Create a private tool that exists but user doesn't have access
+        private_tool = MagicMock(spec=DbTool)
+        private_tool.id = "private-tool-1"
+        private_tool.visibility = "private"
+        private_tool.owner_email = "owner@test.com"
+        private_tool.team_id = "team-1"
+
+        mock_db.get.return_value = private_tool
+
+        # User without access tries to get the tool
+        with pytest.raises(ToolNotFoundError, match="Tool not found: private-tool-1"):
+            await tool_service.get_tool(
+                mock_db, "private-tool-1", requesting_user_email="other@test.com", requesting_user_is_admin=False, requesting_user_team_roles={"team-2": ["viewer"]}  # Different team
+            )
 
 
 class TestToolListingGracefulErrorHandling:
@@ -7102,8 +7131,13 @@ class TestToolServiceHelpers:
         public_payload = {"visibility": "public"}
         assert await service._check_tool_access(MagicMock(), public_payload, None, []) is True
 
+        # Admin bypass does NOT grant access to private resources (security requirement)
         private_payload = {"visibility": "private"}
-        assert await service._check_tool_access(MagicMock(), private_payload, None, None) is True
+        assert await service._check_tool_access(MagicMock(), private_payload, None, None) is False
+
+        # Admin bypass DOES grant access to team resources
+        team_payload = {"visibility": "team", "team_id": "team-1"}
+        assert await service._check_tool_access(MagicMock(), team_payload, None, None) is True
 
     @pytest.mark.asyncio
     async def test_check_tool_access_denies_without_user_or_public_only_token(self):
@@ -9488,7 +9522,13 @@ class TestRustMcpExecutionPlan:
 
     @pytest.mark.asyncio
     async def test_prepare_rust_mcp_tool_execution_oauth_authorization_code_requires_prior_authorization(self, tool_service):
-        """Authorization-code OAuth plans should fail when no stored token exists for the user."""
+        """Authorization-code OAuth plans must raise an actionable error when neither a DB token nor a plugin provides auth.
+
+        Deny-path regression: with no stored OAuth token AND no plugin manager
+        registered (so no plugin can inject Authorization), the post-pre-invoke
+        check must raise locally rather than silently letting the request reach
+        upstream with empty Authorization.
+        """
         cache = self._cache_mock(
             self._cache_payload(
                 gateway={
@@ -9514,8 +9554,108 @@ class TestRustMcpExecutionPlan:
             patch("mcpgateway.services.tool_service.fresh_db_session", _fresh_db_session),
             patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
         ):
-            with pytest.raises(ToolInvocationError, match="OAuth token retrieval failed"):
+            with pytest.raises(ToolInvocationError, match="Please authorize"):
                 await tool_service.prepare_rust_mcp_tool_execution(MagicMock(), "tool-one", app_user_email="user@example.com")
+
+    @pytest.mark.asyncio
+    async def test_prepare_rust_mcp_tool_execution_oauth_authorization_code_plugin_injects_auth(self, tool_service):
+        """Authorization-code OAuth plans must succeed when a plugin injects Authorization in tool_pre_invoke.
+
+        Positive plugin path: with no DB-stored OAuth token, a Vault-style plugin
+        (mocked here) sets the Authorization header during tool_pre_invoke. The
+        post-hook check sees Authorization is present and lets the plan through.
+        """
+        # First-Party
+        from mcpgateway.plugins.framework import HttpHeaderPayload, ToolPreInvokePayload
+        from mcpgateway.plugins.framework.models import PluginResult
+
+        cache = self._cache_mock(
+            self._cache_payload(
+                gateway={
+                    "auth_type": "oauth",
+                    "oauth_config": {"grant_type": "authorization_code"},
+                }
+            )
+        )
+        token_storage = MagicMock()
+        token_storage.get_user_token = AsyncMock(return_value=None)
+        fresh_session = MagicMock()
+
+        @contextmanager
+        def _fresh_db_session():
+            yield fresh_session
+
+        mock_pm = MagicMock()
+        mock_pm.has_hooks_for = MagicMock(side_effect=lambda hook_type: hook_type == ToolHookType.TOOL_PRE_INVOKE)
+
+        async def mock_invoke_hook(hook_type, payload, global_context, local_contexts=None, violations_as_exceptions=False):  # noqa: ARG001
+            modified = ToolPreInvokePayload(
+                name=payload.name,
+                args=payload.args,
+                headers=HttpHeaderPayload({"Authorization": "Bearer plugin-injected-token"}),
+            )
+            return PluginResult(modified_payload=modified, continue_processing=True), {}
+
+        mock_pm.invoke_hook = mock_invoke_hook
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch("mcpgateway.services.tool_service.current_trace_id", MagicMock(get=MagicMock(return_value=None))),
+            patch("mcpgateway.services.tool_service.global_config_cache", MagicMock(get_passthrough_headers=MagicMock(return_value=[]))),
+            patch.object(tool_service, "_check_tool_access", AsyncMock(return_value=True)),
+            patch("mcpgateway.services.token_storage_service.TokenStorageService", return_value=token_storage),
+            patch("mcpgateway.services.tool_service.fresh_db_session", _fresh_db_session),
+            patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", side_effect=lambda _request_headers, headers, *_args, **_kwargs: headers),
+            patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=mock_pm)),
+        ):
+            plan = await tool_service.prepare_rust_mcp_tool_execution(
+                MagicMock(),
+                "tool-one",
+                arguments={"foo": "bar"},
+                app_user_email="user@example.com",
+            )
+
+        assert plan["eligible"] is True
+        assert plan["headers"].get("authorization") == "Bearer plugin-injected-token"
+
+    @pytest.mark.asyncio
+    async def test_prepare_rust_mcp_tool_execution_strips_x_vault_tokens(self, tool_service):
+        """X-Vault-Tokens (case-insensitive) must be stripped from outbound headers regardless of plugin state.
+
+        Defense-in-depth: even if X-Vault-Tokens ends up in passthrough_allowed
+        by misconfiguration, or the Vault plugin is disabled, the gateway must
+        not forward the raw vault header to upstream.
+        """
+        cache = self._cache_mock(
+            self._cache_payload(
+                gateway={
+                    "auth_type": "bearer",
+                    "auth_value": None,
+                }
+            )
+        )
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch("mcpgateway.services.tool_service.current_trace_id", MagicMock(get=MagicMock(return_value=None))),
+            patch("mcpgateway.services.tool_service.global_config_cache", MagicMock(get_passthrough_headers=MagicMock(return_value=[]))),
+            patch.object(tool_service, "_check_tool_access", AsyncMock(return_value=True)),
+            patch(
+                "mcpgateway.services.tool_service.compute_passthrough_headers_cached",
+                return_value={"Authorization": "Bearer real-token", "X-Vault-Tokens": '{"github.com": "ghp_xxx"}', "x-vault-tokens": "lower-case-leak"},
+            ),
+            patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
+        ):
+            plan = await tool_service.prepare_rust_mcp_tool_execution(
+                MagicMock(),
+                "tool-one",
+                request_headers={"X-Tenant-Id": "acme"},
+            )
+
+        assert plan["eligible"] is True
+        outbound_keys_lower = {k.lower() for k in plan["headers"]}
+        assert "x-vault-tokens" not in outbound_keys_lower
+        assert plan["headers"].get("Authorization") == "Bearer real-token"
 
     @pytest.mark.asyncio
     async def test_prepare_rust_mcp_tool_execution_oauth_client_credentials_success(self, tool_service):
