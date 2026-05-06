@@ -377,7 +377,7 @@ def allow_permission(monkeypatch):
     mock_perm_service.check_permission = AsyncMock(return_value=True)
     monkeypatch.setattr("mcpgateway.middleware.rbac.PermissionService", lambda db: mock_perm_service)
     monkeypatch.setattr("mcpgateway.admin.PermissionService", lambda db: mock_perm_service)
-    monkeypatch.setattr("mcpgateway.plugins.framework.get_plugin_manager", AsyncMock(return_value=None))
+    monkeypatch.setattr("mcpgateway.plugins.get_plugin_manager", AsyncMock(return_value=None))
     return mock_perm_service
 
 
@@ -12219,7 +12219,7 @@ async def test_admin_search_roots_denies_without_system_config_permission(monkey
     deny_service.check_permission = AsyncMock(return_value=False)
     monkeypatch.setattr("mcpgateway.middleware.rbac.PermissionService", lambda db: deny_service)
     monkeypatch.setattr("mcpgateway.admin.PermissionService", lambda db: deny_service)
-    monkeypatch.setattr("mcpgateway.plugins.framework.get_plugin_manager", AsyncMock(return_value=None))
+    monkeypatch.setattr("mcpgateway.plugins.get_plugin_manager", AsyncMock(return_value=None))
 
     with pytest.raises(HTTPException) as exc_info:
         await admin_search_roots(q="tmp", limit=10, user={"email": "dev@example.com", "db": mock_db})
@@ -12261,7 +12261,7 @@ async def test_admin_unified_search_roots_empty_for_non_admin(monkeypatch, mock_
     perm_service.check_permission = AsyncMock(side_effect=_check_permission)
     monkeypatch.setattr("mcpgateway.middleware.rbac.PermissionService", lambda db: perm_service)
     monkeypatch.setattr("mcpgateway.admin.PermissionService", lambda db: perm_service)
-    monkeypatch.setattr("mcpgateway.plugins.framework.get_plugin_manager", AsyncMock(return_value=None))
+    monkeypatch.setattr("mcpgateway.plugins.get_plugin_manager", AsyncMock(return_value=None))
 
     result = await admin_unified_search(
         q="tmp",
@@ -22024,7 +22024,7 @@ class TestPublicVisibilityGuard:
         mock_perm_service.check_permission = AsyncMock(return_value=True)
         monkeypatch.setattr("mcpgateway.middleware.rbac.PermissionService", lambda db: mock_perm_service)
         monkeypatch.setattr("mcpgateway.admin.PermissionService", lambda db: mock_perm_service)
-        monkeypatch.setattr("mcpgateway.plugins.framework.get_plugin_manager", AsyncMock(return_value=None))
+        monkeypatch.setattr("mcpgateway.plugins.get_plugin_manager", AsyncMock(return_value=None))
         return mock_perm_service
 
     @pytest.mark.asyncio
@@ -22240,6 +22240,88 @@ class TestPublicVisibilityGuard:
         # No team_id → guard should not fire even with flag=false
         result = await admin_create_grpc_service(service, mock_request, mock_db, user={"email": "u@e.com", "db": mock_db})
         assert result.status_code == 201
+
+    # --- Whitespace-only team_id: treated as absent, public must NOT be blocked ---
+    # Test _check_public_visibility_allowed directly to avoid unrelated form-processing
+    # side effects (e.g. TeamManagementService.verify_team_for_user returning [] for
+    # whitespace-only input, which would cause Pydantic to reject ToolCreate).
+
+    def test_check_public_visibility_spaces_not_blocked(self, monkeypatch):
+        from mcpgateway.admin import _check_public_visibility_allowed
+
+        monkeypatch.setattr("mcpgateway.admin.settings.allow_public_visibility", False)
+        # Should not raise — whitespace-only team_id treated as absent
+        _check_public_visibility_allowed("public", team_id="   ")
+
+    def test_check_public_visibility_tab_not_blocked(self, monkeypatch):
+        from mcpgateway.admin import _check_public_visibility_allowed
+
+        monkeypatch.setattr("mcpgateway.admin.settings.allow_public_visibility", False)
+        _check_public_visibility_allowed("public", team_id="\t")
+
+    def test_check_public_visibility_real_team_id_blocked(self, monkeypatch):
+        from mcpgateway.admin import _check_public_visibility_allowed
+
+        monkeypatch.setattr("mcpgateway.admin.settings.allow_public_visibility", False)
+        with pytest.raises(HTTPException) as exc_info:
+            _check_public_visibility_allowed("public", team_id="team-abc")
+        assert exc_info.value.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# _form_team_id — end-to-end whitespace normalization (#4235)
+# ---------------------------------------------------------------------------
+
+
+class TestFormTeamId:
+    """Unit tests for the _form_team_id normalisation helper."""
+
+    def _make_form(self, team_id_value):
+        """Return a dict-like object whose .get() mirrors multipart form behaviour."""
+        if team_id_value is None:
+            return {}
+        return {"team_id": team_id_value}
+
+    def test_absent_returns_none(self):
+        from mcpgateway.admin import _form_team_id
+
+        assert _form_team_id({}) is None
+
+    def test_none_value_returns_none(self):
+        from mcpgateway.admin import _form_team_id
+
+        # Some form parsers may return None explicitly
+        assert _form_team_id({"team_id": None}) is None
+
+    def test_empty_string_returns_none(self):
+        from mcpgateway.admin import _form_team_id
+
+        assert _form_team_id({"team_id": ""}) is None
+
+    def test_spaces_only_returns_none(self):
+        from mcpgateway.admin import _form_team_id
+
+        assert _form_team_id({"team_id": "   "}) is None
+
+    def test_tab_only_returns_none(self):
+        from mcpgateway.admin import _form_team_id
+
+        assert _form_team_id({"team_id": "\t"}) is None
+
+    def test_newline_only_returns_none(self):
+        from mcpgateway.admin import _form_team_id
+
+        assert _form_team_id({"team_id": "\n"}) is None
+
+    def test_real_team_id_returned_stripped(self):
+        from mcpgateway.admin import _form_team_id
+
+        assert _form_team_id({"team_id": "  team-abc  "}) == "team-abc"
+
+    def test_real_team_id_no_surrounding_spaces(self):
+        from mcpgateway.admin import _form_team_id
+
+        assert _form_team_id({"team_id": "team-abc"}) == "team-abc"
 
 
 # ---------------------------------------------------------------------------
