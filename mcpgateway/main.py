@@ -70,6 +70,8 @@ from starlette.responses import Response as starletteResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 # First-Party
+from mcpgateway.middleware.forwarded_host import ForwardedHostMiddleware
+
 # Import the admin routes from the new module
 from mcpgateway import __version__
 from mcpgateway import version as version_module
@@ -284,6 +286,31 @@ def _is_trusted_internal_mcp_runtime_request(request: Request) -> bool:
     path = getattr(getattr(request, "url", None), "path", "") or ""
     if path.startswith("/_internal/a2a/") and not settings.mcpgateway_a2a_enabled:
         return False
+    return True
+
+
+def _is_jwt_token(token: str) -> bool:
+    """Check if a token looks like a JWT (has 2 dots, 3 base64url parts).
+
+    Rejects local opaque tokens (cf_sess_*, cf_pat_*) that remote gateways
+    cannot validate.
+    """
+    if not token:
+        return False
+    if token.startswith(("cf_sess_", "cf_pat_")):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+
+    for part in parts:
+        if not part:
+            return False
+        try:
+            padded = part + "=" * (-len(part) % 4)
+            base64.urlsafe_b64decode(padded)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return False
     return True
 
 
@@ -1401,6 +1428,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # Validate security configuration
         validate_security_configuration()
 
+        # Validate UAID security configuration
+        validate_uaid_security_config()
+
         # Initialize the plugin manager factory whenever the YAML config is
         # available. We used to gate this on ``settings.plugins.enabled`` but
         # that broke runtime enable-from-disabled: a node that boots with the
@@ -1846,7 +1876,7 @@ def validate_security_configuration():
     logger.info("🔒 Validating security configuration...")
     try:
         current_settings = get_settings()
-        # Get security status
+
         security_status: settings.SecurityStatus = current_settings.get_security_status()
         security_warnings = security_status["warnings"]
 
@@ -1854,14 +1884,15 @@ def validate_security_configuration():
 
         # Warn about ephemeral storage without strict user-in-DB mode
         if not getattr(current_settings, "require_user_in_db", False):
-            database_url = getattr(current_settings, "database_url", settings.database_url)
-            is_ephemeral = ":memory:" in database_url or database_url == "sqlite:///./mcp.db"
+
+            is_ephemeral = ":memory:" in current_settings.database_url or current_settings.database_url == "sqlite:///./mcp.db"
             if is_ephemeral:
                 logger.warning("Using potentially ephemeral storage with platform admin bootstrap enabled. Consider using persistent storage or setting REQUIRE_USER_IN_DB=true for production.")
 
         # Warn about default JWT issuer/audience in non-development environments
         if current_settings.environment != "development":
             if current_settings.jwt_issuer == "mcpgateway":
+
                 logger.warning("Using default JWT_ISSUER in %s environment. Set a unique JWT_ISSUER per environment to prevent cross-environment token acceptance.", current_settings.environment)
             if current_settings.jwt_audience == "mcpgateway-api":
                 logger.warning("Using default JWT_AUDIENCE in %s environment. Set a unique JWT_AUDIENCE per environment to prevent cross-environment token acceptance.", current_settings.environment)
@@ -1971,6 +2002,45 @@ def log_security_recommendations(security_status: settings.SecurityStatus):
             logger.info("  • Enable SSL verification: SKIP_SSL_VERIFY=false")
 
         logger.info("=" * 60)
+
+
+def validate_uaid_security_config() -> None:
+    """Validate UAID security configuration at startup.
+
+    Behavior:
+    - Logs ERROR if A2A enabled but UAID allowlist not configured
+    - Fails startup if UAID_REQUIRE_ALLOWLIST_ON_STARTUP=true (strict mode)
+
+    Design Decision (Issue #4236, Task #5):
+    Default behavior is ERROR logging (non-blocking) to maintain backward compatibility
+    and avoid breaking existing deployments. Operators can opt into fail-fast behavior
+    via UAID_REQUIRE_ALLOWLIST_ON_STARTUP=true for stricter security posture.
+
+    Rationale:
+    - ERROR logging: Visible in logs, doesn't break deployments
+    - Fail-fast (opt-in): Best for production, catches misconfig early
+    - Not implemented: Admin UI banner (requires UI work, not always enabled)
+
+    Raises:
+        RuntimeError: If allowlist misconfigured and strict mode enabled
+    """
+    if settings.mcpgateway_a2a_enabled:
+        if not settings.uaid_allowed_domains and not settings.uaid_allow_all_domains:
+            error_msg = (
+                "🚨 SECURITY: UAID cross-gateway routing is DISABLED. "
+                "Configure UAID_ALLOWED_DOMAINS with trusted domains or set UAID_ALLOW_ALL_DOMAINS=true (unsafe for production). "
+                "Cross-gateway UAID calls will fail until allowlist is configured."
+            )
+
+            logger.error(error_msg)
+
+            # Check for strict mode (fail-fast on misconfiguration)
+            if settings.uaid_require_allowlist_on_startup:
+                raise RuntimeError(
+                    f"{error_msg}\n\n"
+                    "Gateway startup aborted due to UAID_REQUIRE_ALLOWLIST_ON_STARTUP=true. "
+                    "Fix configuration or set UAID_REQUIRE_ALLOWLIST_ON_STARTUP=false to allow startup with ERROR log only."
+                )
 
     logger.info("✅ Security validation completed")
 
@@ -2950,6 +3020,18 @@ app.add_middleware(DocsAuthMiddleware)
 # This ensures all /admin/* routes (except login/logout) require admin status
 app.add_middleware(AdminAuthMiddleware)
 
+# Rewrite Host header from X-Forwarded-Host when behind a reverse proxy.
+# Uvicorn's ProxyHeadersMiddleware handles X-Forwarded-Proto and X-Forwarded-For
+# but not X-Forwarded-Host (upstream issue encode/uvicorn#965).
+# This ensures request.base_url reflects the proxy's public host, fixing the
+# OAuth redirect_uri hint and other URL construction throughout the admin UI.
+# Registered alongside ProxyHeadersMiddleware with the same trust model.
+#
+# Registered BEFORE ProxyHeadersMiddleware so that it is inner (executes after
+# ProxyHeadersMiddleware in the ASGI call chain) and can rely on the scheme
+# already being corrected when deriving the default port for scope["server"].
+app.add_middleware(ForwardedHostMiddleware)
+
 # Trust all proxies (or lock down with a list of host patterns)
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
@@ -2971,6 +3053,18 @@ if settings.security_logging_enabled or _siem_auth_source_enabled or settings.mc
     logger.info("🔐 Authentication context middleware enabled - capturing authentication security events")
 else:
     logger.info("🔐 Security event logging disabled")
+
+# Add CSRF protection middleware
+# This validates CSRF tokens on state-changing requests to prevent Cross-Site Request Forgery attacks
+# Note: Runs after AuthContextMiddleware so request.state.user is available for token validation
+if settings.csrf_enabled:
+    # First-Party
+    from mcpgateway.middleware.csrf_middleware import CSRFMiddleware
+
+    app.add_middleware(CSRFMiddleware)
+    logger.info("🛡️  CSRF protection middleware enabled - validating tokens on state-changing requests")
+else:
+    logger.info("🛡️  CSRF protection middleware disabled")
 
 # Add token usage logging middleware
 # This tracks API token usage for analytics and security monitoring
@@ -4804,6 +4898,30 @@ async def invoke_a2a_agent(
         # and self-referential `endpoint_url` loops.
         hop_count = uaid_utils.read_hop_count(request.headers)
 
+        # Extract bearer token for cross-gateway forwarding
+        # Prefer token extracted by auth middleware (validated and normalized)
+        bearer_token = getattr(request.state, "bearer_token", None)
+
+        # Fallback: extract from Authorization header if middleware didn't set it
+        # (e.g., when auth middleware is disabled or skipped for certain paths)
+        #
+        # Security Note: This fallback extracts the token without local validation,
+        # but security is preserved because:
+        # 1. Remote gateway MUST validate the token (AUTH_REQUIRED enforcement)
+        # 2. Invalid/expired tokens will be rejected by remote gateway's auth middleware
+        # 3. This enables token forwarding even when local auth is disabled for A2A endpoints
+        #
+        # If the token is invalid, remote gateway returns 401, and we propagate error to caller.
+        if not bearer_token:
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                bearer_token = auth_header[7:]  # Remove "Bearer " prefix
+
+        # Only forward JWT-shaped tokens; local opaque tokens cannot be validated by remote gateways
+        if bearer_token and not _is_jwt_token(bearer_token):
+            logger.info("Non-JWT token detected, not forwarding for cross-gateway auth")
+            bearer_token = None
+
         return await a2a_service.invoke_agent(
             db,
             agent_name,
@@ -4813,6 +4931,93 @@ async def invoke_a2a_agent(
             user_email=user_email,
             token_teams=token_teams,
             hop_count=hop_count,
+            bearer_token=bearer_token,
+        )
+    except A2AAgentNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except A2AAgentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@a2a_router.post("/invoke", response_model=Dict[str, Any])
+@require_permission("a2a.invoke")
+async def invoke_a2a_agent_by_id(
+    request: Request,
+    agent_id: str = Body(..., description="Agent UUID or UAID"),
+    parameters: Dict[str, Any] = Body(default_factory=dict),
+    interaction_type: str = Body(default="query"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Invokes an A2A agent by UUID or UAID (passed in body to support forward slashes in UAID).
+
+    This endpoint accepts the agent identifier in the request body instead of the URL path,
+    which allows invoking agents by UAID even when the UAID contains forward slashes
+    (e.g., in the nativeId component).
+
+    Args:
+        request (Request): The FastAPI request object for team_id retrieval.
+        agent_id (str): The UUID or UAID of the agent to invoke.
+        parameters (Dict[str, Any]): Parameters for the agent interaction.
+        interaction_type (str): Type of interaction (query, execute, etc.).
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Dict[str, Any]: The response from the A2A agent.
+
+    Raises:
+        HTTPException: If the agent is not found, user lacks access, or there is an error during invocation.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is invoking A2A agent '{agent_id}' with type '{interaction_type}'")
+        if a2a_service is None:
+            raise HTTPException(status_code=503, detail="A2A service not available")
+
+        # Get filtering context from token (respects token scope)
+        user_email, token_teams, is_admin = get_rpc_filter_context(request, user)
+
+        # Admin bypass - only when token has NO team restrictions
+        if is_admin and token_teams is None:
+            token_teams = None  # Admin unrestricted
+        elif token_teams is None:
+            token_teams = []  # Non-admin without teams = public-only
+
+        user_id = None
+        if isinstance(user, dict):
+            user_id = str(user.get("id") or user.get("sub") or user_email)
+        else:
+            user_id = str(user)
+
+        # Read the federation hop counter from the request header
+        hop_count = uaid_utils.read_hop_count(request.headers)
+
+        # Extract bearer token for cross-gateway forwarding
+        bearer_token = getattr(request.state, "bearer_token", None)
+
+        # Fallback: extract from Authorization header if middleware didn't set it
+        if not bearer_token:
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                bearer_token = auth_header[7:]  # Remove "Bearer " prefix
+
+        # Only forward JWT-shaped tokens; local opaque tokens cannot be validated by remote gateways
+        if bearer_token and not _is_jwt_token(bearer_token):
+            logger.info("Non-JWT token detected, not forwarding for cross-gateway auth")
+            bearer_token = None
+
+        return await a2a_service.invoke_agent(
+            db,
+            agent_name=None,  # Not using name lookup
+            parameters=parameters,
+            interaction_type=interaction_type,
+            agent_id=agent_id,  # Pass agent_id for UUID/UAID lookup
+            user_id=user_id,
+            user_email=user_email,
+            token_teams=token_teams,
+            hop_count=hop_count,
+            bearer_token=bearer_token,
         )
     except A2AAgentNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -9582,11 +9787,12 @@ async def handle_internal_mcp_tools_call(request: Request):
         request: Trusted internal MCP tools/call request.
 
     Returns:
-        JSON-RPC response payload for the tools/call request.
+        dict: JSON-RPC response containing result on success,
+              or JSON-RPC error on plugin failures.
+              All plugin errors returned as structured JSON-RPC (never re-raised)
+              since this is an internal Rust↔Python interface.
 
     Raises:
-        PluginError: Re-raised so plugin middleware can preserve existing behavior.
-        PluginViolationError: Re-raised so plugin middleware can preserve existing behavior.
         Exception: Propagated after best-effort rollback when unexpected failures occur.
     """
     req_id = None
@@ -9662,8 +9868,19 @@ async def handle_internal_mcp_tools_call(request: Request):
             db.close()
 
         return {"jsonrpc": "2.0", "result": result, "id": req_id}
-    except (PluginError, PluginViolationError):
-        raise
+    except PluginViolationError as exc:
+        # Use violation's codes if present, otherwise JSON-RPC defaults
+        error_code = -32602  # Invalid params (JSON-RPC standard)
+        if exc.violation and hasattr(exc.violation, "mcp_error_code") and isinstance(exc.violation.mcp_error_code, int):
+            error_code = exc.violation.mcp_error_code
+
+        return {"jsonrpc": "2.0", "error": {"code": error_code, "message": str(exc)}, "id": req_id}
+    except PluginError as exc:
+        error_code = -32603  # Internal error (JSON-RPC standard)
+        if exc.error and hasattr(exc.error, "mcp_error_code") and isinstance(exc.error.mcp_error_code, int):
+            error_code = exc.error.mcp_error_code
+
+        return {"jsonrpc": "2.0", "error": {"code": error_code, "message": str(exc)}, "id": req_id}
     except JSONRPCError as e:
         error = e.to_dict()
         return {"jsonrpc": "2.0", "error": error["error"], "id": req_id}
@@ -9692,11 +9909,12 @@ async def handle_internal_mcp_tools_call_resolve(request: Request):
         request: Trusted internal MCP tools/call resolve request.
 
     Returns:
-        JSON response containing either an execution plan or a JSON-RPC-visible error.
+        ORJSONResponse: JSON-RPC response containing execution plan on success,
+                        or JSON-RPC error on validation/permission/plugin failures.
+                        All errors returned as structured JSON-RPC (never re-raised)
+                        since this is an internal Rust↔Python interface.
 
     Raises:
-        PluginError: Re-raised so plugin middleware can preserve existing behavior.
-        PluginViolationError: Re-raised so plugin middleware can preserve existing behavior.
         Exception: Propagated after best-effort rollback when unexpected failures occur.
     """
     db = SessionLocal()
@@ -9791,8 +10009,48 @@ async def handle_internal_mcp_tools_call_resolve(request: Request):
                 "id": request_id,
             },
         )
-    except (PluginError, PluginViolationError):
-        raise
+    except PluginViolationError as exc:
+        request_id = body.get("id") if isinstance(body, dict) else None
+        # Use violation's codes if present, otherwise JSON-RPC defaults
+        error_code = -32602  # Invalid params (JSON-RPC standard)
+        http_status = 422
+        if exc.violation:
+            if hasattr(exc.violation, "mcp_error_code") and isinstance(exc.violation.mcp_error_code, int):
+                error_code = exc.violation.mcp_error_code
+            if hasattr(exc.violation, "http_status_code") and isinstance(exc.violation.http_status_code, int):
+                candidate_status = exc.violation.http_status_code
+                if VALID_HTTP_STATUS_CODES.get(candidate_status):
+                    http_status = candidate_status
+
+        response = ORJSONResponse(
+            status_code=http_status,
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": error_code, "message": str(exc)},
+                "id": request_id,
+            },
+        )
+        # Forward validated HTTP headers from violation if present
+        headers = exc.violation.http_headers if exc.violation and exc.violation.http_headers else None
+        if headers:
+            validated_headers = _validate_http_headers(headers)
+            if validated_headers:
+                response.headers.update(validated_headers)
+        return response
+    except PluginError as exc:
+        request_id = body.get("id") if isinstance(body, dict) else None
+        error_code = -32603  # Internal error (JSON-RPC standard)
+        if exc.error and hasattr(exc.error, "mcp_error_code") and isinstance(exc.error.mcp_error_code, int):
+            error_code = exc.error.mcp_error_code
+
+        return ORJSONResponse(
+            status_code=500,
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": error_code, "message": str(exc)},
+                "id": request_id,
+            },
+        )
     except JSONRPCError as exc:
         request_id = body.get("id") if isinstance(body, dict) else None
         return ORJSONResponse(
@@ -11594,9 +11852,10 @@ else:
 if settings.mcpgateway_admin_api_enabled and settings.siem_export_enabled:
     try:
         # First-Party
+        from mcpgateway.admin import enforce_admin_csrf  # pylint: disable=import-outside-toplevel
         from mcpgateway.routers.siem import router as siem_router
 
-        app.include_router(siem_router)
+        app.include_router(siem_router, dependencies=[Depends(enforce_admin_csrf)])
         logger.info("SIEM router included")
     except ImportError as e:  # pragma: no cover - optional import guard
         logger.warning(f"SIEM router not available: {e}")
@@ -11737,10 +11996,11 @@ if settings.llmchat_enabled:
         from mcpgateway.routers.llm_admin_router import llm_admin_router
         from mcpgateway.routers.llm_config_router import llm_config_router
         from mcpgateway.routers.llm_proxy_router import llm_proxy_router
+        from mcpgateway.admin import enforce_admin_csrf  # pylint: disable=import-outside-toplevel
 
         app.include_router(llm_config_router, prefix="/llm", tags=["LLM Configuration"])
         app.include_router(llm_proxy_router, prefix=settings.llm_api_prefix, tags=["LLM Proxy"])
-        app.include_router(llm_admin_router, prefix="/admin/llm", tags=["LLM Admin"])
+        app.include_router(llm_admin_router, prefix="/admin/llm", tags=["LLM Admin"], dependencies=[Depends(enforce_admin_csrf)])
         logger.info("LLM configuration, proxy, and admin routers included")
     except ImportError as e:
         logger.debug(f"LLM routers not available: {e}")
@@ -11781,7 +12041,7 @@ if ADMIN_API_ENABLED:
     # Lazy import: mcpgateway.admin is a large module (~19k lines, ~120ms cold).
     # Only load it when the admin API is actually mounted.
     # First-Party
-    from mcpgateway.admin import admin_router, set_logging_service, validate_section_permissions  # pylint: disable=import-outside-toplevel
+    from mcpgateway.admin import admin_router, enforce_admin_csrf, set_logging_service, validate_section_permissions  # pylint: disable=import-outside-toplevel
 
     set_logging_service(logging_service)
     app.include_router(admin_router)  # Admin routes imported from admin.py
@@ -11793,7 +12053,7 @@ if ADMIN_API_ENABLED:
     # First-Party
     from mcpgateway.routers.runtime_admin_router import runtime_admin_router  # pylint: disable=import-outside-toplevel
 
-    app.include_router(runtime_admin_router, prefix="/admin/runtime", tags=["Runtime Admin"])
+    app.include_router(runtime_admin_router, prefix="/admin/runtime", tags=["Runtime Admin"], dependencies=[Depends(enforce_admin_csrf)])
 else:
     logger.warning("Admin API routes not mounted - Admin API disabled via MCPGATEWAY_ADMIN_API_ENABLED=False")
 

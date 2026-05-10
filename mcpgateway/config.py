@@ -167,15 +167,14 @@ class SecurityConfigurationError(Exception):
 
 
 def calculate_entropy(text: str) -> float:
+    """Calculate Shannon entropy to detect low-randomness secrets.
+
+    Args:
+        text (str): The secret string to evaluate.
+
+    Returns:
+        float: The calculated entropy score.
     """
-        Calculate Shannon entropy to detect low-randomness secrets.
-
-        Args:
-            text (str): The secret string to evaluate.
-
-        Returns:
-            float: The calculated entropy score.
-        """
     if not text:
         return 0.0
     probabilities = [text.count(c) / len(text) for c in set(text)]
@@ -420,6 +419,41 @@ class Settings(BaseSettings):
     )
     embed_environment_in_tokens: bool = Field(default=False, description="Embed environment claim in gateway-issued JWTs for environment isolation")
     validate_token_environment: bool = Field(default=False, description="Reject tokens with mismatched environment claim (tokens without env claim are allowed)")
+
+    # CSRF Protection Configuration
+    csrf_enabled: bool = Field(default=True, description="Enable CSRF protection for state-changing operations")
+    csrf_secret_key: str = Field(default="", description="Secret key for CSRF token generation (falls back to jwt_secret_key if empty)")
+    csrf_token_name: str = Field(default="X-CSRF-Token", description="HTTP header name for CSRF token")
+    csrf_cookie_name: str = Field(default="mcpgateway_csrf_token", description="Cookie name for CSRF token")
+    csrf_token_expiry: int = Field(default=3600, description="CSRF token expiration time in seconds")
+    csrf_cookie_secure: bool = Field(default=True, description="Set Secure flag on CSRF cookie (HTTPS only)")
+    csrf_cookie_samesite: str = Field(default="Strict", description="SameSite attribute for CSRF cookie (Strict, Lax, or None)")
+    csrf_cookie_httponly: bool = Field(default=False, description="Set HttpOnly flag on CSRF cookie (False allows JavaScript to read for API calls)")
+    csrf_check_referer: bool = Field(default=True, description="Validate Referer header for CSRF protection")
+    csrf_rotate_on_login: bool = Field(default=True, description="Rotate CSRF token on user login for enhanced security")
+    csrf_trusted_origins: List[str] = Field(default_factory=list, description="Additional trusted origins for CSRF validation")
+    csrf_exempt_paths: List[str] = Field(
+        default_factory=lambda: [
+            "/health",
+            "/auth/login",
+            "/auth/logout",
+            "/auth/refresh",
+            "/auth/email/login",
+            "/auth/email/register",
+            "/auth/email/forgot-password",
+            "/auth/email/reset-password",
+            "/admin",  # Exempt: all admin routes use per-route enforce_admin_csrf dependency
+            "/admin/login",
+            "/admin/forgot-password",
+            "/admin/reset-password",
+            "/oauth/fetch-tools",  # Exempt: OAuth callback uses enforce_fetch_tools_csrf with origin+double-submit
+            "/docs",
+            "/redoc",
+            "/openapi.json",
+            "/metrics",
+        ],
+        description="Paths exempt from CSRF protection",
+    )
 
     # JSON Schema Validation for registration (Tool Input Schemas, Prompt schemas, etc)
     json_schema_validation_strict: bool = Field(default=True, description="Strict schema validation mode - reject invalid JSON schemas")
@@ -684,12 +718,49 @@ class Settings(BaseSettings):
         ),
     )
 
+    gateway_test_allowed_hosts: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Allowlist of host patterns for the /admin/gateways/test endpoint. When non-empty, "
+            "only URLs matching these patterns are allowed. Patterns support wildcards (e.g., "
+            "'*.example.com', 'api.example.com'). Empty list = use standard SSRF blocking only. "
+            "Recommended: populate with approved gateway hostnames to prevent SSRF abuse."
+        ),
+    )
+
     # UAID Cross-Gateway Routing Security
     uaid_allowed_domains: List[str] = Field(
         default_factory=list,
         description=(
             "Domain allowlist for UAID cross-gateway routing. When not empty, only UAIDs with endpoints "
-            "ending in these domains will be allowed for cross-gateway routing. Empty list = allow all domains."
+            "ending in these domains will be allowed for cross-gateway routing. "
+            "Empty list = DENY all cross-gateway routing (fail-closed, secure default)."
+        ),
+    )
+
+    uaid_allow_all_domains: bool = Field(
+        default=False,
+        description=(
+            "DANGEROUS: Allow UAID cross-gateway routing to any domain. " "This bypasses domain allowlist validation and should NEVER be used in production. " "Only enable for development/testing."
+        ),
+    )
+
+    uaid_forward_auth: bool = Field(
+        default=True,
+        description=(
+            "Forward bearer tokens in cross-gateway UAID calls for RBAC enforcement on remote gateways. "
+            "Requires both gateways to trust the same JWT issuer (shared JWT_SECRET_KEY or federated SSO). "
+            "Disable only if you have an alternative cross-gateway authentication mechanism "
+            "(e.g., mutual TLS, gateway trust tokens, or pre-authenticated service accounts). "
+            "Default: True (recommended for most deployments)."
+        ),
+    )
+
+    uaid_require_allowlist_on_startup: bool = Field(
+        default=False,
+        description=(
+            "Fail-fast mode: abort gateway startup if A2A enabled but UAID allowlist not configured. "
+            "Default false = ERROR log only (non-blocking). Set true for stricter security posture in production."
         ),
     )
 
@@ -718,6 +789,80 @@ class Settings(BaseSettings):
             "while still terminating loops quickly (a ping-pong trips in 4 hops)."
         ),
     )
+
+    @field_validator("uaid_allowed_domains")
+    @classmethod
+    def validate_uaid_allowed_domains(cls, v: List[str]) -> List[str]:
+        """Validate UAID domain allowlist for security.
+
+        Rejects:
+        - localhost, 127.0.0.1 (loopback addresses)
+        - 169.254.x.x (link-local addresses)
+        - Internal IP ranges that should not be in production allowlists
+
+        Args:
+            v: List of allowed domain names
+
+        Returns:
+            Validated domain list
+
+        Raises:
+            ValueError: If any domain is obviously internal/unsafe
+        """
+        if not v:
+            # Empty list is valid (fail-closed default)
+            return v
+
+        invalid_domains = []
+        for domain in v:
+            domain_lower = domain.lower()
+            # Extract host for loopback/link-local checks (strip ports)
+            host_for_check = domain_lower
+            if host_for_check.startswith("[") and "]:" in host_for_check:
+                host_for_check = host_for_check.split("]:")[0] + "]"
+            elif not host_for_check.startswith("[") and ":" in host_for_check and host_for_check.count(":") == 1:
+                # hostname:port (not IPv6) - strip port
+                host_for_check = host_for_check.split(":")[0]
+
+            # Check for localhost variants (including IPv6 bracket notation)
+            if host_for_check in ("localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", "[::0]"):
+                invalid_domains.append((domain, "loopback address"))
+            # Check for link-local
+            elif host_for_check.startswith("169.254."):
+                invalid_domains.append((domain, "link-local address"))
+            # Check for private IP ranges (commonly misconfigured)
+            elif domain_lower.startswith(("10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.", "192.168.")):
+                invalid_domains.append((domain, "private IP range"))
+            # Check for obviously invalid patterns
+            elif " " in domain or "\t" in domain or "\n" in domain:
+                invalid_domains.append((domain, "contains whitespace"))
+
+        if invalid_domains:
+            error_msgs = [f"'{d}' ({reason})" for d, reason in invalid_domains]
+            raise ValueError(f"Invalid domains in UAID_ALLOWED_DOMAINS: {', '.join(error_msgs)}. Use public DNS names only.")
+
+        return v
+
+    @model_validator(mode="after")
+    def validate_uaid_config_consistency(self) -> Self:
+        """Validate UAID configuration for contradictory settings.
+
+        Warns about:
+        - uaid_allow_all_domains=True AND non-empty allowlist (contradictory)
+
+        Returns:
+            Self for chaining
+
+        Note:
+            Uses logger.warning instead of raising to avoid breaking existing configs
+        """
+        if self.uaid_allow_all_domains and self.uaid_allowed_domains:
+            logger.warning(
+                "⚠️  Configuration conflict: UAID_ALLOW_ALL_DOMAINS=true bypasses the configured UAID_ALLOWED_DOMAINS list. "
+                "The allowlist will be ignored. Either disable UAID_ALLOW_ALL_DOMAINS or remove UAID_ALLOWED_DOMAINS."
+            )
+
+        return self
 
     # OAuth Configuration
     oauth_request_timeout: int = Field(default=30, description="OAuth request timeout in seconds")
@@ -786,12 +931,16 @@ class Settings(BaseSettings):
     argon2id_memory_cost: int = Field(default=65536, description="Argon2id memory cost in KiB")
     argon2id_parallelism: int = Field(default=1, description="Argon2id parallelism (number of threads)")
 
-    # Password Policy Configuration
-    password_min_length: int = Field(default=8, description="Minimum password length")
+    # Password Policy Configuration (Enhanced per pentesting recommendations)
+    password_min_length: int = Field(default=8, description="Minimum password length (legacy - use password_min_length_user)")
+    password_min_length_user: int = Field(default=12, description="Minimum password length for user accounts (OWASP recommendation)")
+    password_min_length_privileged: int = Field(default=22, description="Minimum password length for privileged accounts (12 + 10 chars)")
+    password_min_length_service: int = Field(default=20, description="Minimum password length for service accounts (64-128 bit entropy)")
     password_require_uppercase: bool = Field(default=True, description="Require uppercase letters in passwords")
     password_require_lowercase: bool = Field(default=True, description="Require lowercase letters in passwords")
     password_require_numbers: bool = Field(default=False, description="Require numbers in passwords")
     password_require_special: bool = Field(default=True, description="Require special characters in passwords")
+    password_history_count: int = Field(default=5, description="Number of previous passwords to prevent reuse")
 
     # Password change enforcement and policy toggles
     password_change_enforcement_enabled: bool = Field(default=True, description="Master switch for password change enforcement checks")
@@ -1269,6 +1418,10 @@ class Settings(BaseSettings):
             if self.debug and not self.dev_mode:
                 logger.warning("🐛 SECURITY WARNING: Debug mode is enabled in non-dev mode. This may leak sensitive information! Set DEBUG=false for production.")
 
+        # CSRF secret key fallback to JWT secret key
+        if not self.csrf_secret_key:
+            self.csrf_secret_key = self.jwt_secret_key.get_secret_value()
+
         return self
 
     def get_security_warnings(self) -> List[str]:
@@ -1332,7 +1485,7 @@ class Settings(BaseSettings):
         security_score: int
 
     def get_security_status(self) -> SecurityStatus:
-        """Get comprehensive security status and enforces fail-closed logic in production.
+        """Get comprehensive security status and enforce fail-closed logic in production.
 
         Returns:
             SecurityStatus: Dictionary containing security status information including score and warnings.
@@ -1357,11 +1510,10 @@ class Settings(BaseSettings):
         is_prod = self.environment == "production"
         remediation_cmd = "Run 'python3 -m mcpgateway.scripts.init_secrets' to generate secure keys."
 
-        # Evaluate specific critical secrets
         critical_secrets = {
             "JWT_SECRET_KEY": self.jwt_secret_key.get_secret_value(),
             "AUTH_ENCRYPTION_SECRET": self.auth_encryption_secret.get_secret_value(),
-            "BASIC_AUTH_PASSWORD": self.basic_auth_password.get_secret_value()
+            "BASIC_AUTH_PASSWORD": self.basic_auth_password.get_secret_value(),
         }
 
         for name, value in critical_secrets.items():
@@ -1369,14 +1521,13 @@ class Settings(BaseSettings):
                 continue
             is_sentinel = value in self.SENTINEL_VALUES
             is_weak = value.lower() in self.WEAK_VALUES or calculate_entropy(value) < 3.5
-            # Check for empty or "UNCONFIGURED" values
+
             if is_sentinel:
                 error_msg = f"{name} is not configured. Running with default or empty values in production is prohibited as it leaves the gateway unprotected."
                 if is_prod:
                     return self._build_security_response("FAIL", "ERR_MISSING_CONFIG", error_msg, remediation_cmd)
                 logger.warning(f"DEV WARNING: {error_msg} {remediation_cmd}")
 
-            # Check for known weak values
             if self.require_strong_secrets and is_weak:
                 error_msg = f"Weak {name} detected. Using default values in production exposes the gateway to unauthorized access."
                 return self._build_security_response("FAIL", "ERR_WEAK_SECRET", error_msg, remediation_cmd)
@@ -1400,36 +1551,16 @@ class Settings(BaseSettings):
         }
 
     def log_critical_issues(self, status: SecurityStatus) -> None:
-        """
-        Logs critical security issues and provides remediation steps.
 
-        Args:
-            status (SecurityStatus): The security status dictionary to log.
-        """
+        """Log critical security issues and remediation steps."""
         if status["status"] == "FAIL":
-            # [Requirement]: Explain specific risk
             logger.critical(f"[SECURITY FATAL] {status['message']}")
-
-            # [Requirement]: Include generation command
             if status["remediation"]:
                 logger.info(f"REMEDIATION: {status['remediation']}")
-
-            # [Requirement]: Reference documentation
             logger.info("REFERENCE: For full security configuration guide, see: https://github.com/IBM/mcp-context-forge/blob/main/docs/docs/operations/config-validation.md")
 
     def _build_security_response(self, status: str, code: str, msg: str, remediation: str) -> SecurityStatus:
-        """
-        Helper to build a failure response for get_security_status.
-
-        Args:
-            status (str): The overall security status (e.g., "FAIL").
-            code (str): The specific error code.
-            msg (str): The error description.
-            remediation (str): The suggested fix for the user.
-
-        Returns:
-            SecurityStatus: A dictionary containing the structured security response.
-        """
+        """Build a failure response for get_security_status."""
         logger.error(f"[{code}] CRITICAL SECURITY ISSUE: {msg}")
         return {
             "status": status,
@@ -2392,6 +2523,7 @@ class Settings(BaseSettings):
     dev_mode: bool = False
     reload: bool = False
     debug: bool = False
+    expose_error_details: bool = False
 
     # Observability (OpenTelemetry)
     deployment_env: str = Field(default="development", validation_alias=AliasChoices("DEPLOYMENT_ENV", "ENVIRONMENT"), description="Deployment environment label")
@@ -3235,11 +3367,10 @@ def get_settings(**kwargs: Any) -> Settings:
     cfg.validate_transport()
     # Ensure sqlite DB directories exist if needed.
     cfg.validate_database()
-    # Get the status (SUCCESS/FAIL) based on sentinel and weak values
-    security_status = cfg.get_security_status()
 
+    # Get the status (SUCCESS/FAIL) based on sentinel and weak values.
+    security_status = cfg.get_security_status()
     if security_status["status"] == "FAIL":
-        # Log the critical issues (remediation, risk, documentation)
         cfg.log_critical_issues(security_status)
         raise SecurityConfigurationError(security_status["message"])
     # Return the one-and-only Settings instance (cached).

@@ -164,6 +164,7 @@ from mcpgateway.utils.retry_manager import ResilientHttpClient
 from mcpgateway.utils.security_cookies import clear_auth_cookie, CookieTooLargeError, set_auth_cookie
 from mcpgateway.utils.services_auth import decode_auth, encode_auth
 from mcpgateway.utils.sqlalchemy_modifier import json_contains_tag_expr
+from mcpgateway.utils.url_auth import sanitize_url_for_logging
 from mcpgateway.utils.validate_signature import sign_data
 from mcpgateway.utils.verify_credentials import verify_jwt_token_cached
 
@@ -1382,14 +1383,19 @@ def serialize_datetime(obj):
     return obj
 
 
-def validate_password_strength(password: str) -> tuple[bool, str]:
+def validate_password_strength(password: str, email: str = "", is_admin: bool = False) -> tuple[bool, str]:
     """Validate password meets strength requirements.
 
-    Uses configurable settings from config.py for password policy.
+    Delegates to PasswordPolicyService for comprehensive validation including
+    complexity, common password detection, sequential character detection,
+    and username-based validation.
+
     Respects password_policy_enabled toggle - if disabled, all passwords pass.
 
     Args:
         password: Password to validate
+        email: User's email address (for username-based validation)
+        is_admin: Whether this is an admin account (requires longer password)
 
     Returns:
         tuple: (is_valid, error_message)
@@ -1398,30 +1404,16 @@ def validate_password_strength(password: str) -> tuple[bool, str]:
     if not getattr(settings, "password_policy_enabled", True):
         return True, ""
 
-    min_length = getattr(settings, "password_min_length", 8)
-    require_uppercase = getattr(settings, "password_require_uppercase", False)
-    require_lowercase = getattr(settings, "password_require_lowercase", False)
-    require_numbers = getattr(settings, "password_require_numbers", False)
-    require_special = getattr(settings, "password_require_special", False)
+    from mcpgateway.db import SessionLocal
+    from mcpgateway.services.password_policy_service import PasswordPolicyError, PasswordPolicyService
 
-    if len(password) < min_length:
-        return False, f"Password must be at least {min_length} characters long"
-
-    if require_uppercase and not any(c.isupper() for c in password):
-        return False, "Password must contain at least one uppercase letter (A-Z)"
-
-    if require_lowercase and not any(c.islower() for c in password):
-        return False, "Password must contain at least one lowercase letter (a-z)"
-
-    if require_numbers and not any(c.isdigit() for c in password):
-        return False, "Password must contain at least one number (0-9)"
-
-    # Match the special character set used in EmailAuthService
-    special_chars = '!@#$%^&*(),.?":{}|<>'
-    if require_special and not any(c in special_chars for c in password):
-        return False, f"Password must contain at least one special character ({special_chars})"
-
-    return True, ""
+    with SessionLocal() as db:
+        policy = PasswordPolicyService(db)
+        try:
+            policy.validate_user_password(password, email or None, is_admin)
+            return True, ""
+        except PasswordPolicyError as e:
+            return False, str(e)
 
 
 ADMIN_CSRF_COOKIE_NAME = "mcpgateway_csrf_token"
@@ -1436,10 +1428,11 @@ def _admin_cookie_path(request: Request) -> str:
         request: Incoming request used to read ASGI ``root_path``.
 
     Returns:
-        Admin cookie path scoped under the deployed app root.
+        Cookie path scoped to the deployed app root so admin-originated
+        non-/admin mutations can carry the same double-submit token.
     """
     root_path = _resolve_root_path(request)
-    return f"{root_path}/admin" if root_path else "/admin"
+    return root_path or "/"
 
 
 def _normalize_origin_parts(scheme: str, netloc: str) -> tuple[str, str, int]:
@@ -3967,6 +3960,7 @@ async def admin_ui(
             "user_teams": user_teams,
             "mcpgateway_ui_tool_test_timeout": settings.mcpgateway_ui_tool_test_timeout,
             "allow_public_visibility": settings.allow_public_visibility,
+            "auth_header_name": settings.auth_header_name,
             "selected_team_id": selected_team_id,
             "admin_viewing_non_member_team": admin_viewing_non_member_team,
             "ui_airgapped": settings.mcpgateway_ui_airgapped,
@@ -4716,6 +4710,11 @@ async def _admin_logout(request: Request) -> Response:
 
     # Always clear local JWT session cookie.
     clear_auth_cookie(response)
+
+    # Clear CSRF token cookie
+    from mcpgateway.services.csrf_service import clear_csrf_cookie
+    clear_csrf_cookie(response, settings)
+
     use_secure = (settings.environment == "production") or settings.secure_cookies
     response.delete_cookie(
         key="sso_id_token_hint",
@@ -5354,12 +5353,8 @@ async def admin_teams_partial_html(
     # consider implementing SQL-level pagination for non-admin users.
     public_teams_limit = 500
     public_teams = await team_service.discover_public_teams(user_email, limit=public_teams_limit)
-    public_team_ids = {str(t.id) for t in public_teams}
     if len(public_teams) >= public_teams_limit:
         LOGGER.warning(f"Public teams discovery hit limit of {public_teams_limit} for user {user_email}. Some teams may not be visible.")
-
-    # Get pending join requests for public teams
-    pending_requests = team_service.get_pending_join_requests_batch(user_email, list(public_team_ids))
 
     if current_user.is_admin and not relationship:
         # Admin sees all non-personal teams plus their own personal team (single query, correct pagination)
@@ -5469,14 +5464,24 @@ async def admin_teams_partial_html(
         elif team_id in user_team_ids:
             role = user_roles.get(team_id)
             t.relationship = "owner" if role == "owner" else "member"
-        elif current_user.is_admin:
-            # Admins get admin controls for teams they're not members of
-            t.relationship = "none"  # Falls through to admin controls in template
-        elif team_id in public_team_ids:
+        elif t.visibility == "public" and t.is_active:
+            # Public teams show join button for ALL non-members (including admins)
+            # This ensures platform admins go through the normal join request workflow
+            # for public teams, respecting team ownership boundaries. Issue #3488
             t.relationship = "public"
-            t.pending_request = pending_requests.get(team_id)
+        elif current_user.is_admin:
+            # Admins get admin controls ONLY for non-public teams they're not members of
+            # This allows emergency access to private teams for platform maintenance
+            t.relationship = "none"  # Falls through to admin controls in template
 
         enriched_data.append(t)
+
+    # Get pending join requests for all public teams on current page
+    public_team_ids_on_page = [str(t.id) for t in enriched_data if t.relationship == "public"]
+    pending_requests = team_service.get_pending_join_requests_batch(user_email, public_team_ids_on_page)
+    for t in enriched_data:
+        if t.relationship == "public":
+            t.pending_request = pending_requests.get(str(t.id))
 
     # Build query params dict for pagination controls
     query_params_dict = {}
@@ -7777,8 +7782,10 @@ async def admin_create_user(
 
         # Validate password strength
         password = str(form.get("password", ""))
+        email_val = str(form.get("email", ""))
+        is_admin_val = form.get("is_admin") == "on"
         if password:
-            is_valid, error_msg = validate_password_strength(password)
+            is_valid, error_msg = validate_password_strength(password, email_val, is_admin_val)
             if not is_valid:
                 return HTMLResponse(content=f'<div class="text-red-500">Password validation failed: {error_msg}</div>', status_code=400)
 
@@ -7788,10 +7795,10 @@ async def admin_create_user(
 
         # Create new user
         new_user = await auth_service.create_user(
-            email=str(form.get("email", "")),
+            email=email_val,
             password=password,
             full_name=str(form.get("full_name", "")),
-            is_admin=form.get("is_admin") == "on",
+            is_admin=is_admin_val,
             auth_provider="local",
             granted_by=get_user_email(user),  # Pass current admin user for audit trail
         )
@@ -8038,7 +8045,7 @@ async def admin_update_user(
 
         # Validate password if provided
         if password:
-            is_valid, error_msg = validate_password_strength(password)
+            is_valid, error_msg = validate_password_strength(password, decoded_email, is_admin)
             if not is_valid:
                 return HTMLResponse(content=f'<div class="text-red-500">Password validation failed: {error_msg}</div>', status_code=400, headers={"HX-Retarget": "#edit-user-error"})
 
@@ -13999,16 +14006,40 @@ async def admin_test_gateway(
         'admin_test_gateway'
     """
     start_time: float = time.monotonic()
+
+    # Step 1: Enforce allowlist if configured (narrows scope to approved hosts)
+    try:
+        # Standard
+        from urllib.parse import urlparse  # pylint: disable=import-outside-toplevel
+
+        parsed_url = urlparse(str(request.base_url))
+        if parsed_url.hostname:
+            SecurityValidator.validate_host_allowlist(parsed_url.hostname, settings.gateway_test_allowed_hosts, "Gateway test URL")
+    except ValueError as e:
+        safe_url = sanitize_url_for_logging(str(request.base_url))
+        LOGGER.warning("Gateway test hostname not in allowlist for %s: %s", safe_url, e)
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        return GatewayTestResponse(status_code=400, latency_ms=latency_ms, body={"error": "Invalid gateway URL"})
+
+    # Step 2: Validate URL format and SSRF protection (unconditional security check)
     try:
         validated_base_url = SecurityValidator.validate_url(str(request.base_url), "Gateway test URL")
     except ValueError as e:
-        LOGGER.warning("Gateway test URL validation failed for %s: %s", request.base_url, e)
+        safe_url = sanitize_url_for_logging(str(request.base_url))
+        LOGGER.warning("Gateway test URL validation failed for %s: %s", safe_url, e)
         latency_ms = int((time.monotonic() - start_time) * 1000)
         return GatewayTestResponse(status_code=400, latency_ms=latency_ms, body={"error": "Invalid gateway URL"})
 
     full_url = validated_base_url.rstrip("/") + "/" + request.path.lstrip("/")
     full_url = full_url.rstrip("/")
-    LOGGER.debug(f"User {get_user_email(user)} testing server at {validated_base_url}.")
+    safe_validated_url = sanitize_url_for_logging(validated_base_url)
+    LOGGER.debug(f"User {get_user_email(user)} testing server at {safe_validated_url}.")
+
+    # TODO(ICACF-15): DNS rebinding risk — allowlist and SSRF checks resolve DNS, but the
+    # actual ResilientHttpClient request resolves DNS a third time. An attacker-controlled DNS
+    # server could return a public IP during validation and a private IP during the actual
+    # request. Consider pinning the resolved IP for outbound requests (custom transport) or
+    # caching DNS resolution across validation and request phases.
     headers = request.headers or {}
 
     # Attempt to find a registered gateway matching this URL and team.
@@ -14099,7 +14130,7 @@ async def admin_test_gateway(
         structured_logger = get_structured_logger("gateway_service")
         structured_logger.log(
             level="INFO",
-            message=f"Gateway test completed: {request.base_url}",
+            message=f"Gateway test completed: {safe_validated_url}",
             event_type="gateway_tested",
             component="gateway_service",
             user_email=get_user_email(user),
@@ -14108,7 +14139,7 @@ async def admin_test_gateway(
             resource_id=gateway.id if gateway else None,
             custom_fields={
                 "gateway_name": gateway.name if gateway else None,
-                "gateway_url": str(request.base_url),
+                "gateway_url": safe_validated_url,
                 "test_method": request.method,
                 "test_path": request.path,
                 "status_code": response.status_code,
@@ -14119,14 +14150,15 @@ async def admin_test_gateway(
         return GatewayTestResponse(status_code=response.status_code, latency_ms=latency_ms, body=response_body)
 
     except httpx.RequestError as e:
-        LOGGER.warning(f"Gateway test failed: {e}")
+        safe_url = sanitize_url_for_logging(str(request.base_url))
+        LOGGER.warning("Gateway test failed for %s: %s", safe_url, e)
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
         # Structured logging: Log failed gateway test
         structured_logger = get_structured_logger("gateway_service")
         structured_logger.log(
             level="ERROR",
-            message=f"Gateway test failed: {request.base_url}",
+            message=f"Gateway test failed: {safe_url}",
             event_type="gateway_test_failed",
             component="gateway_service",
             user_email=get_user_email(user),
@@ -14136,7 +14168,7 @@ async def admin_test_gateway(
             error=e,
             custom_fields={
                 "gateway_name": gateway.name if gateway else None,
-                "gateway_url": str(request.base_url),
+                "gateway_url": safe_url,
                 "test_method": request.method,
                 "test_path": request.path,
                 "latency_ms": latency_ms,
@@ -15647,6 +15679,7 @@ async def admin_add_a2a_agent(
         generate_uaid = form.get("generate_uaid") == "true"  # Checkbox sends "true" string
         uaid_registry = str(form.get("uaid_registry", "context-forge"))
         uaid_protocol = str(form.get("uaid_protocol", "a2a"))
+        uaid_native_id_override = form.get("uaid_native_id_override") or None
 
         agent_data = A2AAgentCreate(
             name=form["name"],
@@ -15673,6 +15706,7 @@ async def admin_add_a2a_agent(
             generate_uaid=generate_uaid,
             uaid_registry=uaid_registry if generate_uaid else None,
             uaid_protocol=uaid_protocol if generate_uaid else None,
+            uaid_native_id_override=uaid_native_id_override if generate_uaid else None,
         )
 
         LOGGER.info(f"Creating A2A agent: {agent_data.name} at {agent_data.endpoint_url}")
@@ -15904,6 +15938,7 @@ async def admin_edit_a2a_agent(
         generate_uaid = form.get("generate_uaid") == "true"
         uaid_registry = str(form.get("uaid_registry", "")) if generate_uaid else None
         uaid_protocol = str(form.get("uaid_protocol", "")) if generate_uaid else None
+        uaid_native_id_override = form.get("uaid_native_id_override") or None
 
         # Auto-detect OAuth: if oauth_config is present and auth_type not explicitly set, use "oauth"
         auth_type_from_form = str(form.get("auth_type", ""))
@@ -15938,6 +15973,7 @@ async def admin_edit_a2a_agent(
             generate_uaid=generate_uaid,
             uaid_registry=uaid_registry,
             uaid_protocol=uaid_protocol,
+            uaid_native_id_override=uaid_native_id_override if generate_uaid else None,
         )
 
         mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)
