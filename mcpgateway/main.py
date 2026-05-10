@@ -91,6 +91,7 @@ from mcpgateway.cache import ResourceCache, SessionRegistry
 from mcpgateway.common.models import InitializeResult
 from mcpgateway.common.models import JSONRPCError as PydanticJSONRPCError
 from mcpgateway.common.models import ListResourceTemplatesResult, LogLevel, Root
+from mcpgateway.common.query_params import QueryGatewayId, QueryPaginationCursor, QueryTeamId, QueryVisibility
 from mcpgateway.common.validators import SecurityValidator
 from mcpgateway.config import get_settings, SecurityConfigurationError, settings
 from mcpgateway.db import A2AAgent as DbA2AAgent
@@ -103,6 +104,7 @@ from mcpgateway.middleware.compression import SSEAwareCompressMiddleware
 from mcpgateway.middleware.correlation_id import CorrelationIDMiddleware
 from mcpgateway.middleware.http_auth_middleware import HttpAuthMiddleware, run_pre_request_hooks
 from mcpgateway.middleware.protocol_version import MCPProtocolVersionMiddleware
+from mcpgateway.middleware.rate_limit_middleware import RateLimitMiddleware
 from mcpgateway.middleware.rbac import _ACCESS_DENIED_MSG, get_current_user_with_permissions, PermissionChecker, require_permission
 from mcpgateway.middleware.request_logging_middleware import RequestLoggingMiddleware
 from mcpgateway.middleware.security_headers import SecurityHeadersMiddleware
@@ -337,7 +339,8 @@ def _build_internal_mcp_forwarded_user(request: Request) -> Dict[str, Any]:
     try:
         auth_context = decode_internal_mcp_auth_context(header_value)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid trusted MCP auth context: {exc}") from exc
+        logger.debug("Invalid trusted MCP auth context: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid trusted MCP auth context") from exc
 
     setattr(request.state, "_mcp_internal_auth_context", auth_context)
 
@@ -1157,12 +1160,14 @@ def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict
     try:
         main_expr: JSONPath = _parse_jsonpath(jsonpath)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid main JSONPath expression: {e}")
+        logger.debug("Invalid main JSONPath expression: %s", e)
+        raise HTTPException(status_code=400, detail="Invalid JSONPath expression")
 
     try:
         main_matches = main_expr.find(data)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error executing main JSONPath: {e}")
+        logger.debug("Error executing main JSONPath: %s", e)
+        raise HTTPException(status_code=400, detail="Error executing JSONPath expression")
 
     results = [match.value for match in main_matches]
 
@@ -1200,7 +1205,8 @@ def transform_data_with_mappings(data: list[Any], mappings: dict[str, str]) -> l
         try:
             parsed_mappings[new_key] = _parse_jsonpath(mapping_expr_str)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid mapping JSONPath for key '{new_key}': {e}")
+            logger.debug("Invalid mapping JSONPath for key '%s': %s", new_key, e)
+            raise HTTPException(status_code=400, detail=f"Invalid JSONPath expression for key '{new_key}'")
 
     mapped_results = []
     for item in data:
@@ -1209,7 +1215,8 @@ def transform_data_with_mappings(data: list[Any], mappings: dict[str, str]) -> l
             try:
                 mapping_matches = mapping_expr.find(item)
             except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Error executing mapping JSONPath for key '{new_key}': {e}")
+                logger.debug("Error executing mapping JSONPath for key '%s': %s", new_key, e)
+                raise HTTPException(status_code=400, detail=f"Error executing JSONPath expression for key '{new_key}'")
 
             if not mapping_matches:
                 mapped_item[new_key] = None
@@ -2403,6 +2410,32 @@ async def plugin_exception_handler(_request: Request, exc: PluginError):
     return ORJSONResponse(status_code=200, content={"error": json_rpc_error.model_dump()})
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, _exc: Exception) -> ORJSONResponse:
+    """Catch-all handler for unhandled exceptions.
+
+    Logs the full exception server-side and returns a generic message to the
+    client so that stack traces and internal details are never exposed in
+    production responses.
+
+    Args:
+        request: The incoming request.
+        _exc: The unhandled exception (unused; logged via logger.exception context).
+
+    Returns:
+        ORJSONResponse: 500 response with a generic error message.
+    """
+    logger.exception(
+        "Unhandled exception on %s %s",
+        request.method,
+        request.url.path,
+    )
+    return ORJSONResponse(
+        status_code=500,
+        content={"detail": "An internal error occurred. Please try again."},
+    )
+
+
 @app.exception_handler(ContentTypeError)
 async def content_type_exception_handler(_request: Request, exc: ContentTypeError):
     """Handle MIME type validation failures globally.
@@ -2974,6 +3007,17 @@ else:
 
 # Add security headers middleware
 app.add_middleware(SecurityHeadersMiddleware)
+
+# Add rate limiting middleware (after HttpAuthMiddleware for user-aware limiting)
+if settings.rate_limiting_enabled:
+    app.add_middleware(RateLimitMiddleware)
+    logger.info(
+        f"🚦 Rate limiting enabled: Redis={settings.rate_limiting_redis_enabled}, "
+        f"Tiers[CRITICAL={settings.rate_limit_critical_rpm}, "
+        f"HIGH={settings.rate_limit_high_rpm}, "
+        f"MEDIUM={settings.rate_limit_medium_rpm}, "
+        f"LOW={settings.rate_limit_low_rpm}]"
+    )
 
 # Add validation middleware if explicitly enabled
 if settings.validation_middleware_enabled:
@@ -3765,7 +3809,7 @@ async def handle_sampling(request: Request, db: Session = Depends(get_db), user=
 @require_permission("servers.read")
 async def list_servers(
     request: Request,
-    cursor: Optional[str] = Query(None, max_length=500, pattern=r"^[a-zA-Z0-9_=+/-]+$", description="Cursor for pagination"),
+    cursor: QueryPaginationCursor = None,
     include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
     limit: Optional[int] = Query(None, ge=0, description="Maximum number of servers to return"),
     include_inactive: bool = False,
@@ -4465,9 +4509,9 @@ async def list_a2a_agents(
     request: Request,
     include_inactive: bool = False,
     tags: Optional[str] = None,
-    team_id: Optional[str] = Query(None, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$", description="Filter by team ID"),
-    visibility: Optional[str] = Query(None, pattern=r"^(private|team|public)$", description="Filter by visibility (private, team, public)"),
-    cursor: Optional[str] = Query(None, max_length=500, pattern=r"^[a-zA-Z0-9_=+/-]+$", description="Cursor for pagination"),
+    team_id: QueryTeamId = None,
+    visibility: QueryVisibility = None,
+    cursor: QueryPaginationCursor = None,
     include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
     limit: Optional[int] = Query(None, description="Maximum number of agents to return"),
     db: Session = Depends(get_db),
@@ -5038,9 +5082,9 @@ async def list_tools(
     limit: Optional[int] = Query(None, ge=0, description="Maximum number of tools to return. 0 means all (no limit). Default uses pagination_default_page_size."),
     include_inactive: bool = False,
     tags: Optional[str] = None,
-    team_id: Optional[str] = Query(None, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$", description="Filter by team ID"),
-    visibility: Optional[str] = Query(None, pattern=r"^(private|team|public)$", description="Filter by visibility: private, team, public"),
-    gateway_id: Optional[str] = Query(None, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$", description="Filter by gateway ID"),
+    team_id: QueryTeamId = None,
+    visibility: QueryVisibility = None,
+    gateway_id: QueryGatewayId = None,
     db: Session = Depends(get_db),
     apijsonpath: Optional[str] = Query(None, max_length=1000, description="Optional JSONPath modifier as JSON string"),
     user=Depends(get_current_user_with_permissions),
@@ -5613,14 +5657,14 @@ async def toggle_resource_status(
 @require_permission("resources.read")
 async def list_resources(
     request: Request,
-    cursor: Optional[str] = Query(None, max_length=500, pattern=r"^[a-zA-Z0-9_=+/-]+$", description="Cursor for pagination"),
+    cursor: QueryPaginationCursor = None,
     include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
     limit: Optional[int] = Query(None, ge=0, description="Maximum number of resources to return"),
     include_inactive: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
-    gateway_id: Optional[str] = Query(None, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$", description="Filter by gateway ID"),
+    gateway_id: QueryGatewayId = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
@@ -6133,14 +6177,14 @@ async def toggle_prompt_status(
 @require_permission("prompts.read")
 async def list_prompts(
     request: Request,
-    cursor: Optional[str] = Query(None, max_length=500, pattern=r"^[a-zA-Z0-9_=+/-]+$", description="Cursor for pagination"),
+    cursor: QueryPaginationCursor = None,
     include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
     limit: Optional[int] = Query(None, ge=0, description="Maximum number of prompts to return"),
     include_inactive: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
-    gateway_id: Optional[str] = Query(None, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$", description="Filter by gateway ID"),
+    gateway_id: QueryGatewayId = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
@@ -6649,12 +6693,12 @@ async def toggle_gateway_status(
 @require_permission("gateways.read")
 async def list_gateways(
     request: Request,
-    cursor: Optional[str] = Query(None, max_length=500, pattern=r"^[a-zA-Z0-9_=+/-]+$", description="Cursor for pagination"),
+    cursor: QueryPaginationCursor = None,
     include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
     limit: Optional[int] = Query(None, ge=0, description="Maximum number of gateways to return"),
     include_inactive: bool = False,
-    team_id: Optional[str] = Query(None, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$", description="Filter by team ID"),
-    visibility: Optional[str] = Query(None, pattern=r"^(private|team|public)$", description="Filter by visibility: private, team, public"),
+    team_id: QueryTeamId = None,
+    visibility: QueryVisibility = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Union[List[GatewayRead], Dict[str, Any]]:
@@ -7073,7 +7117,7 @@ async def export_root(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         logger.error(f"Unexpected root export error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Root export failed: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Root export failed")
 
 
 @root_router.get("/changes")
@@ -11449,7 +11493,7 @@ async def list_tags(
         return tags
     except Exception as e:
         logger.error(f"Failed to retrieve tags: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve tags: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve tags")
 
 
 @tag_router.get("/{tag_name}/entities", response_model=List[TaggedEntity])
@@ -11503,7 +11547,7 @@ async def get_entities_by_tag(
         return entities
     except Exception as e:
         logger.error(f"Failed to retrieve entities for tag '{tag_name}': {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve entities: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve entities")
 
 
 ####################
@@ -11595,7 +11639,7 @@ async def export_configuration(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Unexpected export error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Export failed")
 
 
 @export_import_router.post("/export/selective", response_model=Dict[str, Any])
@@ -11659,7 +11703,7 @@ async def export_selective_configuration(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Unexpected selective export error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Export failed")
 
 
 @export_import_router.post("/import", response_model=Dict[str, Any])
@@ -11722,16 +11766,16 @@ async def import_configuration(
         raise
     except ImportValidationError as e:
         logger.error(f"Import validation failed for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
-        raise HTTPException(status_code=422, detail=f"Validation error: {str(e)}")
+        raise HTTPException(status_code=422, detail="Import validation failed")
     except ImportConflictError as e:
         logger.error(f"Import conflict for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
-        raise HTTPException(status_code=409, detail=f"Conflict error: {str(e)}")
+        raise HTTPException(status_code=409, detail="Import conflict detected")
     except ImportServiceError as e:
         logger.error(f"Import failed for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Import failed")
     except Exception as e:
         logger.error(f"Unexpected import error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Import failed")
 
 
 @export_import_router.get("/import/status/{import_id}", response_model=Dict[str, Any])

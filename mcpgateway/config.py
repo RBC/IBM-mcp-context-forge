@@ -390,7 +390,7 @@ class Settings(BaseSettings):
     basic_auth_user: str = "admin"
     basic_auth_password: SecretStr = Field(default=SecretStr("changeme"))
     jwt_algorithm: str = "HS256"
-    jwt_secret_key: SecretStr = Field(default=SecretStr("my-test-key"))
+    jwt_secret_key: SecretStr = Field(default=SecretStr("my-test-key-but-now-longer-than-32-bytes"))
     jwt_public_key_path: str = ""
     jwt_private_key_path: str = ""
     jwt_audience: str = "mcpgateway-api"
@@ -718,13 +718,23 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Gateway Test Endpoint Security
     gateway_test_allowed_hosts: List[str] = Field(
         default_factory=list,
         description=(
-            "Allowlist of host patterns for the /admin/gateways/test endpoint. When non-empty, "
-            "only URLs matching these patterns are allowed. Patterns support wildcards (e.g., "
-            "'*.example.com', 'api.example.com'). Empty list = use standard SSRF blocking only. "
-            "Recommended: populate with approved gateway hostnames to prevent SSRF abuse."
+            "Allowlist of host patterns for /admin/gateways/test endpoint. Supports exact hostnames "
+            "(example.com) and wildcards (*.example.com). Empty list = allow only registered gateways. "
+            "This prevents using the test endpoint as an open proxy to reach arbitrary external or "
+            "internal services."
+        ),
+    )
+
+    gateway_test_allow_registered_only: bool = Field(
+        default=True,
+        description=(
+            "When true, /admin/gateways/test only allows testing URLs that match registered gateway "
+            "base URLs in the database. When false, uses gateway_test_allowed_hosts patterns. "
+            "Default true for maximum security (test only what's already registered)."
         ),
     )
 
@@ -2260,7 +2270,7 @@ class Settings(BaseSettings):
     )
     content_pattern_validation_mode: str = Field(
         default="strict",
-        description="Validation mode for pattern detection (US-3): 'strict' (block), 'moderate' (warn+block), 'lenient' (warn only).",
+        description="Validation mode for pattern detection (US-3): 'strict' (warn+block), 'moderate' (same as strict), 'lenient' (warn only).",
     )
     content_blocked_patterns: List[str] = Field(
         default_factory=lambda: [
@@ -2288,7 +2298,13 @@ class Settings(BaseSettings):
     )
     content_pattern_cache_enabled: bool = Field(
         default=True,
-        description="Enable caching of pattern validation results (US-3). Improves performance by caching validation outcomes.",
+        description="Enable caching of successful clean pattern validation results (US-3). Improves performance for repeated clean content without caching malicious detections.",
+    )
+    content_pattern_max_cache_size: int = Field(
+        default=1000,
+        ge=0,
+        le=100000,
+        description="Maximum number of successful clean pattern validation results to cache in memory. Set 0 to disable clean-result caching.",
     )
     content_pattern_max_scan_size: int = Field(
         default=200_000,
@@ -2298,7 +2314,7 @@ class Settings(BaseSettings):
     content_pattern_regex_timeout: float = Field(
         default=1.0,
         gt=0.0,
-        description="Per-pattern regex execution timeout in seconds (US-3). Used natively on Python 3.13+ via re.search(..., timeout=) and as a soft thread-join timeout on older Pythons. Primary ReDoS defense is content_pattern_max_scan_size; this is defense-in-depth.",
+        description="Per-pattern regex execution timeout in seconds (US-3) for custom configured patterns via a soft thread-join timeout. Default built-in patterns use direct search; primary ReDoS defense is content_pattern_max_scan_size.",
     )
 
     # Timeout for SSE task group cleanup (seconds).
@@ -3075,6 +3091,30 @@ Disallow: /
     validation_unsafe_uri_pattern: str = r'[<>"\'\\]'
     validation_tool_name_pattern: str = r"^[a-zA-Z0-9_][a-zA-Z0-9._/-]*$"  # MCP tool naming per SEP-986
     validation_tool_method_pattern: str = r"^[a-zA-Z][a-zA-Z0-9_\./-]*$"
+    validation_cursor_pattern: str = r"^[a-zA-Z0-9_=+/-]+$"
+    validation_tags_filter_pattern: str = r"^[a-zA-Z0-9_,+ .-]*$"
+    validation_gateway_id_list_pattern: str = r"^[a-zA-Z0-9_,-]*$"
+    validation_render_mode_pattern: str = r"^[a-zA-Z_-]+$"
+    validation_visibility_pattern: str = r"^(private|team|public)$"
+    validation_user_identifier_pattern: str = r"^[a-zA-Z0-9._%+@-]+$"
+    validation_http_method_pattern: str = r"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|TRACE|CONNECT)$"
+    validation_export_format_pattern: str = r"^(json|csv|ndjson)$"
+    validation_error_code_pattern: str = r"^[a-zA-Z0-9_]+$"
+    validation_trace_status_pattern: str = r"^(ok|error)$"
+    validation_toolops_mode_pattern: str = r"^(generate|query|status)$"
+    validation_hyphen_identifier_pattern: str = r"^[a-zA-Z0-9_-]+$"
+    validation_team_id_pattern: str = r"^[a-zA-Z0-9_-]+$"
+    validation_scope_id_pattern: str = r"^[a-zA-Z0-9_-]+$"
+    validation_gateway_id_pattern: str = r"^[a-zA-Z0-9_-]+$"
+    validation_trace_id_pattern: str = r"^[a-zA-Z0-9_-]+$"
+    validation_resource_name_pattern: str = r"^[a-zA-Z0-9_. /-]+$"
+    validation_relationship_pattern: str = r"^(owner|member|public)$"
+    validation_entity_type_pattern: str = r"^(tools|resources|prompts|servers)$"
+    validation_time_range_pattern: str = r"^(1h|6h|12h|24h|7d|30d)$"
+    validation_status_filter_pattern: str = r"^(all|ok|error)$"
+    validation_period_type_pattern: str = r"^(hourly|daily)$"
+    validation_aggregation_pattern: str = r"^(5m|24h)$"
+    validation_entity_types_pattern: str = r"^[a-zA-Z,]*$"
 
     # MCP-compliant size limits (configurable via env)
     validation_max_name_length: int = 255
@@ -3115,8 +3155,31 @@ Disallow: /
         "application/octet-stream",
     ]
 
-    # Rate limiting
-    validation_max_requests_per_minute: int = 60
+    # Rate limiting - Redis-backed sliding window
+    rate_limiting_enabled: bool = Field(default=True, description="Enable Redis-backed rate limiting middleware")
+    rate_limiting_redis_enabled: bool = Field(default=True, description="Use Redis for rate limiting (fallback to in-memory if unavailable)")
+
+    # Backward compatibility (used by tests)
+    validation_max_requests_per_minute: int = Field(default=60, description="Backward compatibility for tests")
+
+    # Tier-based rate limits (requests per minute)
+    # CRITICAL: Auth endpoints (login, register, password reset)
+    rate_limit_critical_rpm: int = Field(default=10, description="CRITICAL tier: Auth endpoints")
+    rate_limit_critical_burst: int = Field(default=0, description="CRITICAL tier: No burst allowance")
+    # HIGH: Token management, admin, OAuth
+    rate_limit_high_rpm: int = Field(default=30, description="HIGH tier: Token/admin endpoints")
+    rate_limit_high_burst: int = Field(default=0, description="HIGH tier: No burst allowance")
+    # MEDIUM: MCP, tools, LLM chat (reuse tool_rate_limit)
+    rate_limit_medium_rpm: int = Field(default=100, description="MEDIUM tier: MCP/tools (previously tool_rate_limit)")
+    rate_limit_medium_burst: int = Field(default=20, description="MEDIUM tier: Burst allowance for API clients")
+    # LOW: Health checks, metrics, static content
+    rate_limit_low_rpm: int = Field(default=500, description="LOW tier: Health/metrics")
+    rate_limit_low_burst: int = Field(default=100, description="LOW tier: Burst allowance")
+
+    # Lockout configuration
+    rate_limit_lockout_enabled: bool = Field(default=True, description="Enable temporary lockout after excessive violations")
+    rate_limit_lockout_threshold: int = Field(default=5, description="Violations before account lockout")
+    rate_limit_lockout_duration_minutes: int = Field(default=15, description="Lockout duration in minutes")
 
     # Header passthrough feature (disabled by default for security)
     enable_header_passthrough: bool = Field(default=False, description="Enable HTTP header passthrough feature (WARNING: Security implications - only enable if needed)")
