@@ -66,6 +66,9 @@ import orjson
 from pydantic import AliasChoices, Field, field_validator, HttpUrl, model_validator, PositiveInt, SecretStr, ValidationInfo
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+# First-Party
+from mcpgateway._security_constants import WEAK_VALUES as _CANONICAL_WEAK_VALUES
+
 # Only configure basic logging if no handlers exist yet
 # This prevents conflicts with LoggingService while ensuring config logging works
 if not logging.getLogger().handlers:
@@ -250,15 +253,6 @@ class Settings(BaseSettings):
             "(See Issue #1535 for details)"
         ),
     )
-    skip_migration: bool = Field(
-        default=False,
-        description=(
-            "Skip alembic upgrade head on startup. Use when migrations are managed externally "
-            "(e.g., a dedicated init container or CI pipeline step). "
-            "The idempotent bootstrap helpers (admin user, RBAC roles, resource assignments) still run."
-        ),
-    )
-
     # Absolute paths resolved at import-time (still override-able via env vars)
     templates_dir: Path = Field(default_factory=lambda: Path(str(files("mcpgateway") / "templates")))
     static_dir: Path = Field(default_factory=lambda: Path(str(files("mcpgateway") / "static")))
@@ -399,7 +393,7 @@ class Settings(BaseSettings):
     basic_auth_user: str = "admin"
     basic_auth_password: SecretStr = Field(default=SecretStr("changeme"))
     jwt_algorithm: str = "HS256"
-    jwt_secret_key: SecretStr = Field(default=SecretStr("my-test-key-but-now-longer-than-32-bytes"))
+    jwt_secret_key: SecretStr = Field(default=SecretStr("changeme"))
     jwt_public_key_path: str = ""
     jwt_private_key_path: str = ""
     jwt_audience: str = "mcpgateway-api"
@@ -423,8 +417,8 @@ class Settings(BaseSettings):
     require_token_expiration: bool = Field(default=True, description="Require all JWT tokens to have expiration claims (secure default)")
     require_jti: bool = Field(default=True, description="Require JTI (JWT ID) claim in all tokens for revocation support (secure default)")
     require_user_in_db: bool = Field(
-        default=False,
-        description="Require all authenticated users to exist in the database. When true, disables the platform admin bootstrap mechanism. WARNING: Enabling this on a fresh deployment will lock you out.",
+        default=True,
+        description="Require all authenticated users to exist in the database. When true, disables the platform admin bootstrap mechanism. Set REQUIRE_USER_IN_DB=false in .env for development environments that use the bootstrap admin path.",
     )
     embed_environment_in_tokens: bool = Field(default=False, description="Embed environment claim in gateway-issued JWTs for environment isolation")
     validate_token_environment: bool = Field(default=False, description="Reject tokens with mismatched environment claim (tokens without env claim are allowed)")
@@ -634,7 +628,7 @@ class Settings(BaseSettings):
     proxy_user_header: str = Field(default="X-Authenticated-User", description="Header containing authenticated username from proxy")
 
     #  Encryption key phrase for auth storage
-    auth_encryption_secret: SecretStr = Field(default=SecretStr("my-test-salt"))
+    auth_encryption_secret: SecretStr = Field(default=SecretStr("changeme"))
 
     # Query Parameter Authentication (INSECURE - disabled by default)
     insecure_allow_queryparam_auth: bool = Field(
@@ -999,6 +993,7 @@ class Settings(BaseSettings):
     password_policy_enabled: bool = Field(default=True, description="Enable password complexity validation for new/changed passwords")
     password_prevent_reuse: bool = Field(default=True, description="Prevent reusing the current password when changing")
     password_max_age_days: int = Field(default=90, description="Password maximum age in days before expiry forces a change")
+    password_error_message_max_length: int = Field(default=200, description="Maximum length for password validation error messages in URL redirects (prevents URL overflow)")
     # Account Security Configuration
     max_failed_login_attempts: int = Field(default=5, description="Maximum failed login attempts before account lockout")
     account_lockout_duration_minutes: int = Field(default=60, description="Account lockout duration in minutes")
@@ -1050,6 +1045,25 @@ class Settings(BaseSettings):
     # UI/Admin Feature Flags
     mcpgateway_ui_enabled: bool = False
     mcpgateway_admin_api_enabled: bool = False
+
+    # Migration runner ownership.
+    # When True, the gateway lifespan does NOT call bootstrap_db.main();
+    # the deployment is expected to run migrations as a separate step
+    # (Helm pre-install Job, init container, CI step, etc.). The library
+    # default is False so `docker run mcpgateway:latest` continues to
+    # bootstrap its own schema without operator action. The Helm chart
+    # ships this as True when the migration Job is enabled, so the
+    # contract "Job runs migrations, app pods skip" is enforced at the
+    # chart layer.
+    mcpgateway_skip_migrations: bool = Field(
+        default=False,
+        description=(
+            "When True, gateway pods skip the in-pod bootstrap_db call. "
+            "Pair with a dedicated migration runner (Helm pre-install Job, "
+            "init container, etc.) that ensures the schema is at head before "
+            "pods start."
+        ),
+    )
     mcpgateway_ui_airgapped: bool = Field(default=False, description="Use local CDN assets instead of external CDNs for airgapped deployments")
     mcpgateway_ui_embedded: bool = Field(default=False, description="Enable embedded UI mode (hides select header controls by default)")
     mcpgateway_ui_hide_sections: Annotated[list[str], NoDecode] = Field(
@@ -1227,17 +1241,7 @@ class Settings(BaseSettings):
 
     # Values used to detect unconfigured or insecure deployment states
     SENTINEL_VALUES: ClassVar[list[str]] = ["", "UNCONFIGURED"]
-    WEAK_VALUES: ClassVar[list[str]] = [
-        "my-test-key",
-        "my-test-key-but-now-longer-than-32-bytes",
-        "my-test-salt",
-        "changeme",
-        "secret",
-        "password",
-        "test-secret",
-        "my-secret",
-        "12345678",
-    ]
+    WEAK_VALUES: ClassVar[list[str]] = list(_CANONICAL_WEAK_VALUES)
 
     # database-backed polling settings for session message delivery
     poll_interval: float = Field(default=1.0, description="Initial polling interval in seconds for checking new session messages")
@@ -1335,12 +1339,11 @@ class Settings(BaseSettings):
         else:
             value = str(v)
 
-        # Check for default/weak secrets
-        if not info.data.get("client_mode"):
-            weak_secrets = ["my-test-key", "my-test-key-but-now-longer-than-32-bytes", "my-test-salt", "changeme", "secret", "password"]
-            if value.lower() in weak_secrets:
-                logger.warning(f"🔓 SECURITY WARNING - {field_name}: Default/weak secret detected! Please set a strong, unique value for production.")
+        # Check for default/weak secrets — applies regardless of client_mode
+        if value.lower() in [v.lower() for v in cls.WEAK_VALUES]:
+            logger.warning(f"🔓 SECURITY WARNING - {field_name}: Default/weak secret detected! Please set a strong, unique value for production.")
 
+        if not info.data.get("client_mode"):
             # Check minimum length
             if len(value) < 32:
                 logger.warning(f"⚠️  SECURITY WARNING - {field_name}: Secret should be at least 32 characters long. Current length: {len(value)}")
@@ -1456,6 +1459,24 @@ class Settings(BaseSettings):
         Returns:
             Itself.
         """
+        # Reject weak/default secrets in non-development environments.
+        # This check applies regardless of client_mode — client_mode was intended to skip
+        # operational warnings (auth_required, SSL, debug), not secret-strength enforcement.
+        weak_secrets = {v.lower() for v in self.WEAK_VALUES}
+        env = str(self.environment).lower()
+        for field_name, secret_field in (("jwt_secret_key", self.jwt_secret_key), ("auth_encryption_secret", self.auth_encryption_secret)):
+            val = secret_field.get_secret_value()
+            if val.lower().startswith("__replace_me__"):
+                raise SecurityConfigurationError(f"{field_name}: Value is an unset placeholder (__REPLACE_ME__). " "Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values.")
+            if val.lower() in weak_secrets:
+                if env != "development":
+                    raise SecurityConfigurationError(
+                        f"{field_name}: Weak/default secret rejected in '{env}' environment. " "Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values."
+                    )
+        # In development mode, weak secrets are allowed but the `validate_secrets` field
+        # validator (above) still emits a SECURITY WARNING for each affected field.
+        # This satisfies the spec requirement that development environments warn on weak secrets.
+
         if not self.client_mode:
             # Check for dangerous combinations - only log warnings, don't raise errors
             if not self.auth_required and self.mcpgateway_ui_enabled:
@@ -1568,7 +1589,7 @@ class Settings(BaseSettings):
         for name, value in critical_secrets.items():
             if name == "BASIC_AUTH_PASSWORD" and not (self.mcpgateway_ui_enabled or self.api_allow_basic_auth or self.docs_allow_basic_auth):
                 continue
-            is_sentinel = value in self.SENTINEL_VALUES
+            is_sentinel = value in self.SENTINEL_VALUES or value.lower().startswith("__replace_me__")
             is_weak = value.lower() in self.WEAK_VALUES or calculate_entropy(value) < 3.5
 
             if is_sentinel:
