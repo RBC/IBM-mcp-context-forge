@@ -67,7 +67,7 @@ from mcpgateway import version as version_module
 from mcpgateway.auth import get_current_user, get_user_team_roles
 
 # Re-export canonical get_user_email from auth_context for backward compatibility.
-from mcpgateway.auth_context import get_scoped_resource_access_context, get_user_email
+from mcpgateway.auth_context import get_scoped_resource_access_context, get_token_teams_from_request, get_user_email
 from mcpgateway.cache.a2a_stats_cache import a2a_stats_cache
 from mcpgateway.cache.global_config_cache import global_config_cache
 from mcpgateway.common.models import LogLevel
@@ -4175,7 +4175,7 @@ async def admin_login_handler(request: Request, db: Session = Depends(get_db)) -
         >>> # Mock request with form data
         >>> mock_request = MagicMock(spec=Request)
         >>> mock_request.scope = {"root_path": "/test"}
-        >>> mock_form = {"email": "admin@example.com", "password": "changeme"}
+        >>> mock_form = {"email": "admin@example.com", "password": "changeme"}  # pragma: allowlist secret
         >>> mock_request.form = AsyncMock(return_value=mock_form)
         >>>
         >>> mock_db = MagicMock()
@@ -4828,9 +4828,9 @@ async def change_password_required_handler(request: Request, db: Session = Depen
         >>> mock_request = MagicMock(spec=Request)
         >>> mock_request.scope = {"root_path": "/test"}
         >>> mock_form = {
-        ...     "current_password": "oldpass",
-        ...     "new_password": "newpass123",
-        ...     "confirm_password": "newpass123"
+        ...     "current_password": "oldpass",  # pragma: allowlist secret
+        ...     "new_password": "newpass123",  # pragma: allowlist secret
+        ...     "confirm_password": "newpass123"  # pragma: allowlist secret
         ... }
         >>> mock_request.form = AsyncMock(return_value=mock_form)
         >>> mock_request.cookies = {"jwt_token": "test_token"}
@@ -8583,6 +8583,13 @@ async def admin_tools_partial_html(
 
     # If render=controls, return only pagination controls
     if render == "controls":
+        # NOTE: hx_target/hx_swap must match what tools_partial.html sets when
+        # rendering the inline pagination_controls include — currently
+        # `#tools-table` with swap=outerHTML. Diverging here would cause
+        # subsequent pagination clicks (after a controls-only re-render) to
+        # swap into a target that the success-path doesn't own and trigger
+        # the same `o.querySelector` null-fragment crash that caused the
+        # `_loading` deadlock the rest of this PR fixes.
         return request.app.state.templates.TemplateResponse(
             request,
             "pagination_controls.html",
@@ -8590,8 +8597,10 @@ async def admin_tools_partial_html(
                 "request": request,
                 "pagination": pagination.model_dump(),
                 "base_url": base_url,
-                "hx_target": "#tools-table-body",
+                "hx_target": "#tools-table",
+                "hx_swap": "outerHTML",
                 "hx_indicator": "#tools-loading",
+                "table_name": "tools",
                 "query_params": query_params_dict,
                 "root_path": _resolve_root_path(request),
             },
@@ -15393,7 +15402,7 @@ async def admin_import_configuration(request: Request, db: Session = Depends(get
         "import_data": { ... },
         "conflict_strategy": "update",
         "dry_run": false,
-        "rekey_secret": "optional-new-secret",
+        "rekey_secret": "optional-new-secret",  # pragma: allowlist secret
         "selected_entities": { ... }
     }
     """
@@ -15489,6 +15498,7 @@ async def admin_list_import_statuses(user=Depends(get_current_user_with_permissi
 @require_permission("a2a.read", allow_admin_bypass=False)
 async def admin_get_agent(
     agent_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Dict[str, Any]:
@@ -15496,6 +15506,7 @@ async def admin_get_agent(
 
     Args:
         agent_id: Agent ID.
+        request: FastAPI request object (required for token team extraction via request.state.token_teams).
         db: Database session.
         user: Authenticated user.
 
@@ -15513,19 +15524,23 @@ async def admin_get_agent(
         'admin_get_agent'
     """
     LOGGER.debug(f"User {get_user_email(user)} requested details for agent ID {agent_id}")
+    user_email = get_user_email(user)
+    token_teams = get_token_teams_from_request(request)
+
     try:
-        agent = await a2a_service.get_agent(db, agent_id)
+        agent = await a2a_service.get_agent(db, agent_id, user_email=user_email, token_teams=token_teams)
         return agent.model_dump(by_alias=True)
     except A2AAgentNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         LOGGER.error(f"Error getting agent {agent_id}: {e}")
-        raise e
+        raise
 
 
 @admin_router.get("/a2a", response_model=PaginatedResponse)
 @require_permission("a2a.read", allow_admin_bypass=False)
 async def admin_list_a2a_agents(
+    request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
@@ -15543,6 +15558,7 @@ async def admin_list_a2a_agents(
         page (int): Page number (1-indexed) for offset pagination.
         per_page (int): Number of items per page.
         include_inactive (bool): Whether to include inactive agents in the results.
+        request (Request): FastAPI request object (required for token team extraction via request.state.token_teams).
         db (Session): Database session dependency.
         user (dict): Authenticated user dependency.
 
@@ -15573,6 +15589,7 @@ async def admin_list_a2a_agents(
 
     LOGGER.debug(f"User {get_user_email(user)} requested A2A Agent list (page={page}, per_page={per_page})")
     user_email = get_user_email(user)
+    token_teams = get_token_teams_from_request(request)
 
     # Call a2a_service.list_agents with page-based pagination
     paginated_result = await a2a_service.list_agents(
@@ -15581,6 +15598,7 @@ async def admin_list_a2a_agents(
         page=page,
         per_page=per_page,
         user_email=user_email,
+        token_teams=token_teams,
     )
 
     # Return standardized paginated response
