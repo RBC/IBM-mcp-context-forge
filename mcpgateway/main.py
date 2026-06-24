@@ -197,7 +197,7 @@ from mcpgateway.transports.streamablehttp_transport import (
 from mcpgateway.utils import uaid as uaid_utils
 from mcpgateway.utils.admin_check import is_admin_bypass_granted
 from mcpgateway.utils.csp_nonce import get_csp_nonce_from_request
-from mcpgateway.utils.error_formatter import ErrorFormatter
+from mcpgateway.utils.error_formatter import ErrorFormatter, sanitize_validation_error_for_log, should_expose_error_details
 from mcpgateway.utils.internal_http import internal_loopback_base_url, internal_loopback_verify
 from mcpgateway.utils.metadata_capture import MetadataCapture
 from mcpgateway.utils.orjson_response import ORJSONResponse
@@ -1642,9 +1642,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             total_pool = settings.db_pool_size + settings.db_max_overflow
             total_connections = workers * total_pool
             logger.warning(
-                "⚠️  DATABASE POOL: Running with %d gunicorn workers. "
-                "Total max DB connections = workers(%d) * (pool_size + max_overflow) = %d * %d = %d. "
-                "Ensure PostgreSQL max_connections >= %d. ",
+                "⚠️  DATABASE POOL: Running with %d gunicorn workers. Total max DB connections = workers(%d) * (pool_size + max_overflow) = %d * %d = %d. Ensure PostgreSQL max_connections >= %d. ",
                 workers,
                 workers,
                 workers,
@@ -1957,7 +1955,6 @@ def validate_security_configuration():
 
         # Warn about ephemeral storage without strict user-in-DB mode
         if not getattr(current_settings, "require_user_in_db", False):
-
             is_ephemeral = ":memory:" in current_settings.database_url or current_settings.database_url == "sqlite:///./mcp.db"
             if is_ephemeral:
                 logger.warning("Using potentially ephemeral storage with platform admin bootstrap enabled. Consider using persistent storage or setting REQUIRE_USER_IN_DB=true for production.")
@@ -1965,7 +1962,6 @@ def validate_security_configuration():
         # Warn about default JWT issuer/audience in non-development environments
         if current_settings.environment != "development":
             if current_settings.jwt_issuer == "mcpgateway":
-
                 logger.warning("Using default JWT_ISSUER in %s environment. Set a unique JWT_ISSUER per environment to prevent cross-environment token acceptance.", current_settings.environment)
             if current_settings.jwt_audience == "mcpgateway-api":
                 logger.warning("Using default JWT_AUDIENCE in %s environment. Set a unique JWT_AUDIENCE per environment to prevent cross-environment token acceptance.", current_settings.environment)
@@ -2169,6 +2165,11 @@ async def request_validation_exception_handler(_request: Request, exc: RequestVa
     Returns:
         JSONResponse: A 422 Unprocessable Entity response with error details.
     """
+    logger.warning("Request validation error on %s: %s", _request.url.path if _request else "unknown", sanitize_validation_error_for_log(exc))
+
+    if not should_expose_error_details():
+        return ORJSONResponse(status_code=422, content={"detail": "An error occurred, please try again."})
+
     if _request.url.path.startswith("/tools"):
         error_details = []
 
@@ -2185,8 +2186,7 @@ async def request_validation_exception_handler(_request: Request, exc: RequestVa
             error_detail = {"type": type_, "loc": loc, "msg": msg, "ctx": ctx_serializable}
             error_details.append(error_detail)
 
-        response_content = {"detail": error_details}
-        return ORJSONResponse(status_code=422, content=response_content)
+        return ORJSONResponse(status_code=422, content={"detail": error_details})
     return await fastapi_default_validation_handler(_request, exc)
 
 
@@ -3110,10 +3110,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 if settings.header_size_validation_enabled:
     app.add_middleware(HeaderSizeMiddleware)
     logger.info(
-        f"📏 RFC 6585 header size validation enabled: "
-        f"max_total={settings.max_header_total_size_bytes}B, "
-        f"max_field={settings.max_header_field_size_bytes}B, "
-        f"max_count={settings.max_header_count}"
+        f"📏 RFC 6585 header size validation enabled: max_total={settings.max_header_total_size_bytes}B, max_field={settings.max_header_field_size_bytes}B, max_count={settings.max_header_count}"
     )
 
 # Add rate limiting middleware (after HttpAuthMiddleware for user-aware limiting)

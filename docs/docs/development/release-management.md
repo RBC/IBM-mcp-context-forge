@@ -195,17 +195,10 @@ Update non-Python dependencies across the repository.
 
 ### 3.1 Rust dependencies
 
-Update the root workspace `Cargo.lock`, plus any standalone Rust server locks outside the workspace, and verify they build and pass tests:
+Update the root workspace `Cargo.lock` and verify the workspace builds and passes tests:
 
 ```bash
-# Update the root Rust workspace lockfile
 cargo update --workspace
-
-# Update standalone Rust MCP server locks
-for manifest in mcp-servers/rust/*/Cargo.toml; do
-  server_dir="$(dirname "$manifest")"
-  (cd "$server_dir" && cargo update)
-done
 
 # Verify build + lint + tests
 make rust-check
@@ -358,14 +351,12 @@ All formatting and linting checks must pass with zero errors.
 ### 4.1 Code formatting
 
 ```bash
-make autoflake isort black
+make ruff-format
 ```
 
 | Target | What it checks |
 |--------|----------------|
-| `autoflake` | Removes unused imports and variables |
-| `isort` | Sorts imports (profile=black) |
-| `black` | Formats Python code (line length 200) |
+| `ruff-format` | Formats Python code (includes import sorting and unused code removal) |
 
 !!! note "Pre-commit hooks run automatically"
     The configured pre-commit hooks (whitespace, EOF fixers, detect-secrets, AST checks, etc.) are enforced at commit time and in CI — they do not need a dedicated release step. If a release commit passes pre-commit locally it will pass in CI; otherwise investigate before tagging.
@@ -1501,7 +1492,7 @@ make install-dev
 make pip-audit
 
 # 2. Rust / Go / JS / CDN dependency updates
-# ... repeat for all Cargo.toml dirs (see Section 3) ...
+cargo update --workspace
 # ... go get -u ./... && go mod tidy for all go.mod dirs ...
 make linting-go-gosec linting-go-govulncheck
 npm update && npm audit && npm audit fix
@@ -1514,7 +1505,7 @@ make docker-prod DOCKER_BUILD_ARGS="--no-cache"
 make test
 
 # 4. Format, lint & security
-make autoflake isort black
+make ruff-format
 make ruff vulture bandit interrogate pylint verify
 make yamllint tomllint jsonlint
 make lint-web

@@ -20,12 +20,12 @@ grpcio-reflection = "2026-06-18T23:59:59Z"
 sqlalchemy = "2026-06-18T23:59:59Z"
 starlette = "2026-06-18T23:59:59Z"
 cpex = "2026-06-18T23:59:59Z"
-cpex-url-reputation = "2026-06-18T23:59:59Z"
-cpex-rate-limiter = "2026-06-18T23:59:59Z"
-cpex-encoded-exfil-detection = "2026-06-18T23:59:59Z"
-cpex-pii-filter = "2026-06-18T23:59:59Z"
-cpex-retry-with-backoff = "2026-06-18T23:59:59Z"
-cpex-secrets-detection = "2026-06-18T23:59:59Z"
+cpex-url-reputation = "2026-06-24T23:59:59Z"
+cpex-rate-limiter = "2026-06-24T23:59:59Z"
+cpex-encoded-exfil-detection = "2026-06-24T23:59:59Z"
+cpex-pii-filter = "2026-06-24T23:59:59Z"
+cpex-retry-with-backoff = "2026-06-24T23:59:59Z"
+cpex-secrets-detection = "2026-06-24T23:59:59Z"
 granian = "2026-06-18T23:59:59Z"
 tornado = "2026-06-10T23:59:59Z"
 langsmith = "2026-06-20T23:59:59Z"
@@ -279,12 +279,12 @@ templating = [
 # External plugin packages (optional)
 # Install with: pip install mcp-contextforge-gateway[plugins]
 plugins = [
-    "cpex-encoded-exfil-detection>=0.3.4",
-    "cpex-pii-filter>=0.3.4",
-    "cpex-rate-limiter>=0.1.5",
-    "cpex-retry-with-backoff>=0.3.4",
-    "cpex-secrets-detection>=0.3.5",
-    "cpex-url-reputation>=0.3.3",
+    "cpex-encoded-exfil-detection>=0.3.5",
+    "cpex-pii-filter>=0.3.5",
+    "cpex-rate-limiter>=0.1.6",
+    "cpex-retry-with-backoff>=0.3.5",
+    "cpex-secrets-detection>=0.3.6",
+    "cpex-url-reputation>=0.3.4",
 ]
 
 # gRPC Support (EXPERIMENTAL - optional, disabled by default)
@@ -445,6 +445,7 @@ target-version = "py311"
 select = ["E3", "E4", "E7", "E9", "F", "D1", "D417", "PL", "G004"]
 ignore = [
     # ---- Rules already disabled in .pylintrc (intentionally relaxed) ----
+    "PLW0717",  # Try clause contains too many statements (> 5)
     "PLR0904",  # too-many-public-methods  (pylint R0904)
     "PLR0912",  # too-many-branches        (pylint R0912)
     "PLR0913",  # too-many-arguments       (pylint R0913)

@@ -177,7 +177,7 @@ from mcpgateway.services.team_management_service import TeamManagementService, U
 from mcpgateway.services.token_catalog_service import TokenCatalogService
 from mcpgateway.services.tool_service import ToolError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError, ToolService
 from mcpgateway.utils.create_jwt_token import create_jwt_token, get_jwt_token
-from mcpgateway.utils.error_formatter import ErrorFormatter
+from mcpgateway.utils.error_formatter import ErrorFormatter, sanitize_validation_error_for_log
 from mcpgateway.utils.metadata_capture import MetadataCapture
 from mcpgateway.utils.orjson_response import ORJSONResponse
 from mcpgateway.utils.pagination import paginate_query
@@ -8013,9 +8013,7 @@ async def admin_create_user(
         )
 
         # If the user was created with the default password, optionally force password change
-        if (
-            settings.password_change_enforcement_enabled and getattr(settings, "require_password_change_for_default_password", True) and password == settings.default_user_password.get_secret_value()
-        ):  # nosec B105
+        if settings.password_change_enforcement_enabled and getattr(settings, "require_password_change_for_default_password", True) and password == settings.default_user_password.get_secret_value():  # nosec B105
             new_user.password_change_required = True
             db.commit()
 
@@ -8133,12 +8131,16 @@ async def admin_get_user_edit(
                     <input type="text" name="full_name" value="{user_obj.full_name or ""}" required
                            class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 text-gray-900 dark:text-white">
                 </div>
-                {"" if is_editing_self else f'''<div>
+                {
+            ""
+            if is_editing_self
+            else f'''<div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
                         <input type="checkbox" name="is_admin" {"checked" if user_obj.is_admin else ""}
                                class="mr-2"> Administrator
                     </label>
-                </div>'''}
+                </div>'''
+        }
                 <div>
                     <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
                         <input type="checkbox" name="email_verified" {"checked" if user_obj.is_email_verified() else ""}
@@ -13229,7 +13231,7 @@ async def admin_add_resource(request: Request, db: Session = Depends(get_db), us
             )
 
         if isinstance(ex, ValidationError):
-            LOGGER.error(f"ValidationError in admin_add_resource: {ErrorFormatter.format_validation_error(ex)}")
+            LOGGER.error("ValidationError in admin_add_resource: %s", sanitize_validation_error_for_log(ex))
             return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
@@ -13358,7 +13360,7 @@ async def admin_edit_resource(
             LOGGER.warning("Rollback failed (ignoring for SQLite compatibility): %s", rollback_error)
 
         if isinstance(ex, ValidationError):
-            LOGGER.error(f"ValidationError in admin_edit_resource: {ErrorFormatter.format_validation_error(ex)}")
+            LOGGER.error("ValidationError in admin_edit_resource: %s", sanitize_validation_error_for_log(ex))
             return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
@@ -13609,7 +13611,7 @@ async def admin_add_prompt(request: Request, db: Session = Depends(get_db), user
         )
     except Exception as ex:
         if isinstance(ex, ValidationError):
-            LOGGER.error(f"ValidationError in admin_add_prompt: {ErrorFormatter.format_validation_error(ex)}")
+            LOGGER.error("ValidationError in admin_add_prompt: %s", sanitize_validation_error_for_log(ex))
             return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
@@ -13740,7 +13742,7 @@ async def admin_edit_prompt(
         return ORJSONResponse(content={"message": str(e), "success": False}, status_code=403)
     except Exception as ex:
         if isinstance(ex, ValidationError):
-            LOGGER.error(f"ValidationError in admin_edit_prompt: {ErrorFormatter.format_validation_error(ex)}")
+            LOGGER.error("ValidationError in admin_edit_prompt: %s", sanitize_validation_error_for_log(ex))
             return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=422)
         if isinstance(ex, IntegrityError):
             error_message = ErrorFormatter.format_database_error(ex)
@@ -15070,7 +15072,7 @@ async def admin_import_tools(
             # Detailed format for frontend
             "details": {
                 "success": [item["name"] for item in created if item.get("name")],
-                "failed": [{"name": item["name"], "error": item["error"].get("message", str(item["error"]))} for item in errors],
+                "failed": [{"name": item["name"], "error": item["error"].get("message") or item["error"].get("detail", str(item["error"]))} for item in errors],
             },
         }
 
